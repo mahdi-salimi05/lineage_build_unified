@@ -1,0 +1,125 @@
+From 65eaac408e302e0f689b9e1d26aa28f7b577697a Mon Sep 17 00:00:00 2001
+From: Pierre-Hugues Husson <phh@phh.me>
+Date: Wed, 4 Nov 2026 15:42:02 +0330
+Subject: [PATCH] Make BTM_BYPASS_EXTRA_ACL_SETUP dynamic
+
+Rebased onto current lineage-17.1 (btm_establish_continue now also
+handles the LE transport inside the same block).
+---
+ hci/include/bt_hci_bdroid.h  |  3 +++
+ internal_include/bt_target.h |  3 +++
+ stack/btm/btm_acl.cc         | 38 ++++++++++++++++++------------------
+ stack/btm/btm_sec.cc         | 18 ++++++++---------
+ 4 files changed, 34 insertions(+), 28 deletions(-)
+
+diff --git a/hci/include/bt_hci_bdroid.h b/hci/include/bt_hci_bdroid.h
+index cf2c1136f..e2844db82 100644
+--- a/hci/include/bt_hci_bdroid.h
++++ b/hci/include/bt_hci_bdroid.h
+@@ -32,6 +32,9 @@
+ #ifdef HAS_BDROID_BUILDCFG
+ #include "bdroid_buildcfg.h"
+ #endif
++#ifndef BTM_BYPASS_EXTRA_ACL_SETUP
++#define BTM_BYPASS_EXTRA_ACL_SETUP TRUE
++#endif
+ 
+ /******************************************************************************
+  *  Constants & Macros
+diff --git a/internal_include/bt_target.h b/internal_include/bt_target.h
+index 773597033..8cfff8406 100644
+--- a/internal_include/bt_target.h
++++ b/internal_include/bt_target.h
+@@ -32,6 +32,9 @@
+ #ifdef HAS_BDROID_BUILDCFG
+ #include "bdroid_buildcfg.h"
+ #endif
++#ifndef BTM_BYPASS_EXTRA_ACL_SETUP
++#define BTM_BYPASS_EXTRA_ACL_SETUP TRUE
++#endif
+ 
+ #include "bt_types.h" /* This must be defined AFTER buildcfg.h */
+ 
+diff --git a/stack/btm/btm_acl.cc b/stack/btm/btm_acl.cc
+index a1715a03c..01613df57 100644
+--- a/stack/btm/btm_acl.cc
++++ b/stack/btm/btm_acl.cc
+@@ -1218,27 +1218,27 @@ void btm_read_remote_ext_features_failed(uint8_t status, uint16_t handle) {
+ void btm_establish_continue(tACL_CONN* p_acl_cb) {
+   tBTM_BL_EVENT_DATA evt_data;
+   BTM_TRACE_DEBUG("btm_establish_continue");
+-#if (BTM_BYPASS_EXTRA_ACL_SETUP == FALSE)
+-  if (p_acl_cb->transport == BT_TRANSPORT_BR_EDR) {
+-    /* For now there are a some devices that do not like sending */
+-    /* commands events and data at the same time. */
+-    /* Set the packet types to the default allowed by the device */
+-    btm_set_packet_types(p_acl_cb, btm_cb.btm_acl_pkt_types_supported);
+-
+-    if (btm_cb.btm_def_link_policy)
+-      BTM_SetLinkPolicy(p_acl_cb->remote_addr, &btm_cb.btm_def_link_policy);
+-  } else if (p_acl_cb->transport == BT_TRANSPORT_LE) {
+-    tBTM_SEC_DEV_REC* p_dev_rec = btm_find_dev(p_acl_cb->remote_addr);
+-    if (p_dev_rec == nullptr) {
+-      LOG_WARN(LOG_TAG, "No security record for %s",
+-               PRIVATE_ADDRESS(p_acl_cb->remote_addr));
+-    } else if (p_dev_rec->sec_flags & BTM_SEC_LE_LINK_KEY_KNOWN) {
+-      btm_ble_set_encryption(
+-          p_acl_cb->remote_addr, BTM_BLE_SEC_ENCRYPT,
+-          p_dev_rec->role_master ? BTM_ROLE_MASTER : BTM_ROLE_SLAVE);
++  if (!BTM_BYPASS_EXTRA_ACL_SETUP) {
++    if (p_acl_cb->transport == BT_TRANSPORT_BR_EDR) {
++      /* For now there are a some devices that do not like sending */
++      /* commands events and data at the same time. */
++      /* Set the packet types to the default allowed by the device */
++      btm_set_packet_types(p_acl_cb, btm_cb.btm_acl_pkt_types_supported);
++
++      if (btm_cb.btm_def_link_policy)
++        BTM_SetLinkPolicy(p_acl_cb->remote_addr, &btm_cb.btm_def_link_policy);
++    } else if (p_acl_cb->transport == BT_TRANSPORT_LE) {
++      tBTM_SEC_DEV_REC* p_dev_rec = btm_find_dev(p_acl_cb->remote_addr);
++      if (p_dev_rec == nullptr) {
++        LOG_WARN(LOG_TAG, "No security record for %s",
++                 PRIVATE_ADDRESS(p_acl_cb->remote_addr));
++      } else if (p_dev_rec->sec_flags & BTM_SEC_LE_LINK_KEY_KNOWN) {
++        btm_ble_set_encryption(
++            p_acl_cb->remote_addr, BTM_BLE_SEC_ENCRYPT,
++            p_dev_rec->role_master ? BTM_ROLE_MASTER : BTM_ROLE_SLAVE);
++      }
+     }
+   }
+-#endif
+   if (p_acl_cb->link_up_issued) {
+     BTM_TRACE_ERROR("%s: Already link is up ", __func__);
+     return;
+diff --git a/stack/btm/btm_sec.cc b/stack/btm/btm_sec.cc
+index d5d698c27..dd6a18cc4 100644
+--- a/stack/btm/btm_sec.cc
++++ b/stack/btm/btm_sec.cc
+@@ -4473,15 +4473,15 @@ void btm_sec_connected(const RawAddress& bda, uint16_t handle, uint8_t status,
+   if (p_acl_cb) {
+ /* whatever is in btm_establish_continue() without reporting the BTM_BL_CONN_EVT
+  * event */
+-#if (BTM_BYPASS_EXTRA_ACL_SETUP == FALSE)
+-    /* For now there are a some devices that do not like sending */
+-    /* commands events and data at the same time. */
+-    /* Set the packet types to the default allowed by the device */
+-    btm_set_packet_types(p_acl_cb, btm_cb.btm_acl_pkt_types_supported);
+-
+-    if (btm_cb.btm_def_link_policy)
+-      BTM_SetLinkPolicy(p_acl_cb->remote_addr, &btm_cb.btm_def_link_policy);
+-#endif
++    if(!BTM_BYPASS_EXTRA_ACL_SETUP) {
++      /* For now there are a some devices that do not like sending */
++      /* commands events and data at the same time. */
++      /* Set the packet types to the default allowed by the device */
++      btm_set_packet_types(p_acl_cb, btm_cb.btm_acl_pkt_types_supported);
++
++      if (btm_cb.btm_def_link_policy)
++        BTM_SetLinkPolicy(p_acl_cb->remote_addr, &btm_cb.btm_def_link_policy);
++    }
+   }
+   btm_acl_created(bda, p_dev_rec->dev_class, p_dev_rec->sec_bd_name, handle,
+                   HCI_ROLE_SLAVE, BT_TRANSPORT_BR_EDR);
+-- 
+2.43.0
+
