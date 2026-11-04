@@ -1,155 +1,197 @@
 name: Build LineageOS 17.1 GSI
 
+# Builds a LineageOS 17.1 (Android 10) Treble GSI using
+# https://github.com/AndyCGYan/lineage_build_unified (branch lineage-17.1).
+#
+# Save as: .github/workflows/build-lineage-17.1-gsi.yml
+#
+# NOTE: AOSP builds are huge. A free GitHub-hosted runner (4 vCPU / 16 GB RAM,
+# 6 h job limit) may NOT finish a cold build in time. This workflow saves a
+# ccache on every run (even a timed-out one), so re-running it makes progress.
+# For reliable builds, set the repo variable RUNNER_LABEL to a larger or
+# self-hosted runner (Settings -> Secrets and variables -> Actions -> Variables).
+
 on:
   workflow_dispatch:
     inputs:
       variant:
-        description: 'GSI Variant to build'
+        description: 'GSI variant to build (a/b = A-only / A-B, v = vanilla, N = no su, S = with PHH su)'
         required: true
-        default: 'treble_arm_avN'
+        default: 'treble_arm64_bvN'
         type: choice
         options:
-          - 'treble_arm_avN'    # ARM32 A-Only Vanilla (No Root)
-          - 'treble_arm_avS'    # ARM32 A-Only with PHH Superuser
-          - 'treble_arm_bvN'    # ARM32 A/B Vanilla
-          - 'treble_a64_avN'    # ARM32_Binder64 A-Only Vanilla
-          - 'treble_a64_bvN'    # ARM32_Binder64 A/B Vanilla
-          - 'treble_arm64_avN'  # ARM64 A-Only Vanilla
-          - 'treble_arm64_bvN'  # ARM64 A/B Vanilla
-          - 'all'               # Build all variants (requires self-hosted runner)
+          - treble_arm64_bvN   # ARM64, A/B, vanilla
+          - treble_arm64_bvS   # ARM64, A/B, vanilla + su
+          - treble_arm64_avN   # ARM64, A-only, vanilla
+          - treble_arm64_avS
+          - treble_a64_bvN     # ARM32 userspace + 64-bit binder, A/B
+          - treble_a64_bvS
+          - treble_a64_avN
+          - treble_a64_avS
+          - treble_arm_bvN     # ARM32, A/B
+          - treble_arm_bvS
+          - treble_arm_avN     # ARM32, A-only
+          - treble_arm_avS
+          - all                # The script's own list: all six archs, S variants (needs a very large runner)
+      partial_clone:
+        description: 'Use a git partial clone for repo sync (saves disk; turn off if the sync fails)'
+        required: false
+        default: true
+        type: boolean
       create_release:
-        description: 'Publish build as a GitHub Release'
+        description: 'Publish the result as a GitHub Release'
         required: false
         default: false
         type: boolean
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360 # 6-hour GitHub Actions maximum limit
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-22.04' }}
+    timeout-minutes: 360 # maximum for GitHub-hosted runners
+    permissions:
+      contents: write # only used by the release step
+
+    env:
+      USE_CCACHE: '1'
+      CCACHE_DIR: /home/runner/.ccache
+      CCACHE_COMPRESS: '1'
+      LC_ALL: C
 
     steps:
-      - name: Maximize Free Disk Space
-        run: |
-          echo "Free disk space before cleanup:"
-          df -h /
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          sudo apt-get clean
-          echo "Free disk space after cleanup:"
-          df -h /
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 4096
+          temp-reserve-mb: 512
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
 
-      - name: Setup Swap Space
-        run: |
-          sudo swapoff -a || true
-          sudo fallocate -l 12G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          free -h
-
-      - name: Install Build Dependencies & Tools
+      - name: Install build dependencies and repo
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
-            git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+            git gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \
             lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev \
             libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
-            squashfs-tools xsltproc zip zlib1g-dev python3 python2 \
-            python-is-python3 openjdk-11-jdk xz-utils
-          
-          # Install Google Repo tool
-          mkdir -p "$HOME/bin"
-          curl -s https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
-          chmod a+x "$HOME/bin/repo"
-          echo "$HOME/bin" >> $GITHUB_PATH
+            squashfs-tools xsltproc zip zlib1g-dev python3 python2 xz-utils
 
-      - name: Configure Git Identity
+          # Android 10 expects `python` to be Python 2 (do NOT use python-is-python3)
+          sudo ln -sf /usr/bin/python2 /usr/bin/python
+          python --version
+
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configure git
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           git config --global color.ui false
+          git config --global core.compression 0
 
-      - name: Clone AndyCGYan Treble Experimentations
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-lineage17-${{ inputs.variant }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-lineage17-${{ inputs.variant }}-
+            ccache-lineage17-
+
+      - name: Fetch treble_experimentations
         run: |
-          # Andy's scripts expect treble_experimentations inside $HOME
+          # buildbot_treble.sh calls ~/treble_experimentations/apply-patches.sh
           git clone --depth=1 https://github.com/AndyCGYan/treble_experimentations "$HOME/treble_experimentations"
 
-      - name: Initialize LineageOS Workspace & Sync Treble Scripts
+      - name: Initialize workspace
         run: |
-          mkdir -p "$HOME/lineage"
-          cd "$HOME/lineage"
+          # Large volume created by maximize-build-space
+          mkdir -p "$GITHUB_WORKSPACE/lineage" "$GITHUB_WORKSPACE/build-output"
+          # The script writes images to ~/build-output
+          ln -sfn "$GITHUB_WORKSPACE/build-output" "$HOME/build-output"
 
-          # 1. Initialize LineageOS 17.1 shallow tree to fit in runner storage
-          repo init -u https://github.com/LineageOS/android.git -b lineage-17.1 --depth=1
+          cd "$GITHUB_WORKSPACE/lineage"
 
-          # 2. Clone treble patches
-          git clone --depth=1 https://github.com/AndyCGYan/treble_patches -b lineage-17.1 treble_patches
+          # NOTE: no `--depth=1` on purpose. The script runs `git revert <sha>`
+          # on several projects, and those commits do not exist in a shallow clone.
+          # A partial clone keeps full history but defers file contents.
+          EXTRA=""
+          if [ "${{ inputs.partial_clone }}" = "true" ]; then
+            EXTRA="--partial-clone"
+          fi
+          repo init -u https://github.com/LineageOS/android.git -b lineage-17.1 $EXTRA < /dev/null
 
-          # 3. Clone lineage_build_unified (must be named treble_build_los)
-          git clone --depth=1 https://github.com/AndyCGYan/lineage_build_unified -b lineage-17.1 treble_build_los
+          # Directory names are what buildbot_treble.sh expects
+          git clone https://github.com/AndyCGYan/treble_patches -b lineage-17.1 treble_patches
+          git clone https://github.com/AndyCGYan/lineage_build_unified -b lineage-17.1 treble_build_los
 
-      - name: Configure Target Variant
+      - name: Select target variant
         run: |
-          cd "$HOME/lineage/treble_build_los"
-          TARGET="${{ github.event.inputs.variant }}"
+          cd "$GITHUB_WORKSPACE/lineage/treble_build_los"
+          TARGET="${{ inputs.variant }}"
 
           if [ "$TARGET" != "all" ]; then
-            echo "Configuring build script to build ONLY: $TARGET"
-            # Comment out any active buildVariant lines in buildbot_treble.sh
-            sed -i 's/^buildVariant/# buildVariant/g' buildbot_treble.sh
-            # Append target variant
-            echo "buildVariant $TARGET" >> buildbot_treble.sh
-          else
-            echo "Building all variants."
+            # Drop the six hard-coded `buildVariant treble_*` calls (not the
+            # `buildVariant() {` function definition) and build only the chosen one.
+            sed -i '/^buildVariant treble_/d' buildbot_treble.sh
+            sed -i "/^ls ~\/build-output/i buildVariant $TARGET" buildbot_treble.sh
           fi
 
-      - name: Run Buildbot Script
+          bash -n buildbot_treble.sh
+          echo "Variant calls in the script:"
+          grep -n '^buildVariant' buildbot_treble.sh
+
+      - name: Sync, patch and build
+        timeout-minutes: 330 # leave time for the cache save below if this is cut off
         run: |
-          cd "$HOME/lineage"
-          # treble_build_los/buildbot_treble.sh handles manifest copy, repo sync,
-          # patching, lunching the target, and building the system image.
+          cd "$GITHUB_WORKSPACE/lineage"
+          export CCACHE_EXEC="$(command -v ccache)"
+          ccache -M 8G
           bash treble_build_los/buildbot_treble.sh
 
-      - name: Compress Output Images & Checksums
+      - name: Save ccache
+        if: ${{ always() }}
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-lineage17-${{ inputs.variant }}-${{ github.run_id }}
+
+      - name: Compress images and write checksums
         run: |
-          cd "$HOME/build-output"
-          echo "Generated images:"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cd "$GITHUB_WORKSPACE/build-output"
           ls -lh
-
-          for img in *.img; do
-            if [ -f "$img" ]; then
-              echo "Compressing $img..."
-              xz -9 -v -T0 "$img"
-            fi
+          for img in lineage-*.img; do
+            echo "Compressing $img"
+            xz -6 -T0 -v -c "$img" > "$GITHUB_WORKSPACE/dist/$img.xz"
+            rm -f "$img"
           done
+          cd "$GITHUB_WORKSPACE/dist"
+          sha256sum *.img.xz | tee SHA256SUMS.txt
 
-          sha256sum *.img.xz > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
-      - name: Upload Artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lineage-17.1-GSI-${{ github.event.inputs.variant }}
+          name: lineage-17.1-GSI-${{ inputs.variant }}
           path: |
-            /home/runner/build-output/*.img.xz
-            /home/runner/build-output/SHA256SUMS.txt
+            dist/*.img.xz
+            dist/SHA256SUMS.txt
+          compression-level: 0 # already xz-compressed
           retention-days: 7
 
       - name: Create GitHub Release
-        if: ${{ github.event.inputs.create_release == 'true' }}
+        if: ${{ inputs.create_release }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: lineage-17.1-${{ github.event.inputs.variant }}-${{ github.run_id }}
-          name: LineageOS 17.1 GSI (${{ github.event.inputs.variant }})
-          draft: false
-          prerelease: false
+          tag_name: lineage-17.1-${{ inputs.variant }}-${{ github.run_id }}
+          name: LineageOS 17.1 GSI (${{ inputs.variant }})
           files: |
-            /home/runner/build-output/*.img.xz
-            /home/runner/build-output/SHA256SUMS.txt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            dist/*.img.xz
+            dist/SHA256SUMS.txt
