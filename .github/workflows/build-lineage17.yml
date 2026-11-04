@@ -38,6 +38,11 @@ on:
         required: false
         default: true
         type: boolean
+      free_repo_dir:
+        description: 'Delete .repo after patching, before compiling (frees ~20-35 GB; the compile does not need it)'
+        required: false
+        default: true
+        type: boolean
       create_release:
         description: 'Publish the result as a GitHub Release'
         required: false
@@ -53,15 +58,19 @@ jobs:
 
     env:
       USE_CCACHE: '1'
-      CCACHE_DIR: /home/runner/.ccache
+      # ccache lives on the big build volume, NOT on the small root disk
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_COMPRESS: '1'
       LC_ALL: C
+      GOGC: '50' # more frequent Go GC: lowers soong_build peak memory (costs a little CPU)
 
     steps:
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 4096
+          # Root keeps the OS, apt packages and the temp dir where actions/cache writes
+          # its archive before upload, so it needs more than a few GB of headroom.
+          root-reserve-mb: 10240
           temp-reserve-mb: 512
           swap-size-mb: 1
           remove-dotnet: 'true'
@@ -105,7 +114,7 @@ jobs:
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
-          path: /home/runner/.ccache
+          path: ${{ github.workspace }}/.ccache
           key: ccache-lineage17-${{ inputs.variant }}-${{ github.run_id }}
           restore-keys: |
             ccache-lineage17-${{ inputs.variant }}-
@@ -179,19 +188,46 @@ jobs:
           echo "Variant calls in the script:"
           grep -n '^buildVariant' buildbot_treble.sh
 
+      - name: Free .repo before compiling
+        if: ${{ inputs.free_repo_dir }}
+        run: |
+          cd "$GITHUB_WORKSPACE/lineage/treble_build_los"
+          # buildbot_treble.sh patches inline (there is no applyPatches function), and the
+          # patching ends right before this line, so .repo can go just before compiling.
+          grep -q '^export WITHOUT_CHECK_API=true' buildbot_treble.sh \
+            || { echo "::error::anchor line not found in buildbot_treble.sh"; exit 1; }
+          sed -i '/^export WITHOUT_CHECK_API=true/i echo "Freeing .repo:"; du -sh .repo; rm -rf .repo; df -h .' buildbot_treble.sh
+          bash -n buildbot_treble.sh
+
       - name: Sync, patch and build
         timeout-minutes: 330 # leave time for the cache save below if this is cut off
         run: |
           cd "$GITHUB_WORKSPACE/lineage"
+
+          # Keep the runner agent from being OOM-killed (otherwise the job just "loses
+          # communication"); the build gets killed instead and you get a real error.
+          for pid in $(pgrep -f 'bin/Runner\.(Listener|Worker)' || true); do
+            sudo sh -c "echo -1000 > /proc/$pid/oom_score_adj" 2>/dev/null || true
+          done
+          sudo sysctl -w vm.swappiness=10 || true
+
+          # Disk and memory every 10 minutes, so a future failure shows what ran out
+          ( while true; do
+              sleep 600
+              echo "[monitor $(date +%H:%M)]"; df -h / "$GITHUB_WORKSPACE" | cat; free -h | sed -n 1,3p
+            done ) &
+          MONITOR=$!
+          trap 'kill $MONITOR 2>/dev/null || true' EXIT
+
           export CCACHE_EXEC="$(command -v ccache)"
-          ccache -M 8G
+          ccache -M 4G
           bash treble_build_los/buildbot_treble.sh
 
       - name: Save ccache
         if: ${{ always() }}
         uses: actions/cache/save@v4
         with:
-          path: /home/runner/.ccache
+          path: ${{ github.workspace }}/.ccache
           key: ccache-lineage17-${{ inputs.variant }}-${{ github.run_id }}
 
       - name: Compress images and write checksums
