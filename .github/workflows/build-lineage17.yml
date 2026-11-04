@@ -1,0 +1,155 @@
+name: Build LineageOS 17.1 GSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'GSI Variant to build'
+        required: true
+        default: 'treble_arm_avN'
+        type: choice
+        options:
+          - 'treble_arm_avN'    # ARM32 A-Only Vanilla (No Root)
+          - 'treble_arm_avS'    # ARM32 A-Only with PHH Superuser
+          - 'treble_arm_bvN'    # ARM32 A/B Vanilla
+          - 'treble_a64_avN'    # ARM32_Binder64 A-Only Vanilla
+          - 'treble_a64_bvN'    # ARM32_Binder64 A/B Vanilla
+          - 'treble_arm64_avN'  # ARM64 A-Only Vanilla
+          - 'treble_arm64_bvN'  # ARM64 A/B Vanilla
+          - 'all'               # Build all variants (requires self-hosted runner)
+      create_release:
+        description: 'Publish build as a GitHub Release'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360 # 6-hour GitHub Actions maximum limit
+
+    steps:
+      - name: Maximize Free Disk Space
+        run: |
+          echo "Free disk space before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo apt-get clean
+          echo "Free disk space after cleanup:"
+          df -h /
+
+      - name: Setup Swap Space
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install Build Dependencies & Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev \
+            libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev python3 python2 \
+            python-is-python3 openjdk-11-jdk xz-utils
+          
+          # Install Google Repo tool
+          mkdir -p "$HOME/bin"
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Configure Git Identity
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+
+      - name: Clone AndyCGYan Treble Experimentations
+        run: |
+          # Andy's scripts expect treble_experimentations inside $HOME
+          git clone --depth=1 https://github.com/AndyCGYan/treble_experimentations "$HOME/treble_experimentations"
+
+      - name: Initialize LineageOS Workspace & Sync Treble Scripts
+        run: |
+          mkdir -p "$HOME/lineage"
+          cd "$HOME/lineage"
+
+          # 1. Initialize LineageOS 17.1 shallow tree to fit in runner storage
+          repo init -u https://github.com/LineageOS/android.git -b lineage-17.1 --depth=1
+
+          # 2. Clone treble patches
+          git clone --depth=1 https://github.com/AndyCGYan/treble_patches -b lineage-17.1 treble_patches
+
+          # 3. Clone lineage_build_unified (must be named treble_build_los)
+          git clone --depth=1 https://github.com/AndyCGYan/lineage_build_unified -b lineage-17.1 treble_build_los
+
+      - name: Configure Target Variant
+        run: |
+          cd "$HOME/lineage/treble_build_los"
+          TARGET="${{ github.event.inputs.variant }}"
+
+          if [ "$TARGET" != "all" ]; then
+            echo "Configuring build script to build ONLY: $TARGET"
+            # Comment out any active buildVariant lines in buildbot_treble.sh
+            sed -i 's/^buildVariant/# buildVariant/g' buildbot_treble.sh
+            # Append target variant
+            echo "buildVariant $TARGET" >> buildbot_treble.sh
+          else
+            echo "Building all variants."
+          fi
+
+      - name: Run Buildbot Script
+        run: |
+          cd "$HOME/lineage"
+          # treble_build_los/buildbot_treble.sh handles manifest copy, repo sync,
+          # patching, lunching the target, and building the system image.
+          bash treble_build_los/buildbot_treble.sh
+
+      - name: Compress Output Images & Checksums
+        run: |
+          cd "$HOME/build-output"
+          echo "Generated images:"
+          ls -lh
+
+          for img in *.img; do
+            if [ -f "$img" ]; then
+              echo "Compressing $img..."
+              xz -9 -v -T0 "$img"
+            fi
+          done
+
+          sha256sum *.img.xz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-17.1-GSI-${{ github.event.inputs.variant }}
+          path: |
+            /home/runner/build-output/*.img.xz
+            /home/runner/build-output/SHA256SUMS.txt
+          retention-days: 7
+
+      - name: Create GitHub Release
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: lineage-17.1-${{ github.event.inputs.variant }}-${{ github.run_id }}
+          name: LineageOS 17.1 GSI (${{ github.event.inputs.variant }})
+          draft: false
+          prerelease: false
+          files: |
+            /home/runner/build-output/*.img.xz
+            /home/runner/build-output/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
