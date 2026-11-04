@@ -70,6 +70,12 @@ jobs:
           remove-codeql: 'true'
           remove-docker-images: 'true'
 
+      - name: Checkout this repo (for ci-patches/)
+        uses: actions/checkout@v4
+        with:
+          path: ci
+          sparse-checkout: ci-patches
+
       - name: Install build dependencies and repo
         run: |
           sudo apt-get update
@@ -131,6 +137,31 @@ jobs:
           # Directory names are what buildbot_treble.sh expects
           git clone https://github.com/AndyCGYan/treble_patches -b lineage-17.1 treble_patches
           git clone https://github.com/AndyCGYan/lineage_build_unified -b lineage-17.1 treble_build_los
+
+      - name: Fix patches that drifted from current LineageOS 17.1
+        run: |
+          cd "$GITHUB_WORKSPACE/lineage"
+
+          # 1) system/bt: LineageOS later added an LE branch inside the #if block that
+          #    phh's "Make BTM_BYPASS_EXTRA_ACL_SETUP dynamic" patch rewrites, so the
+          #    original no longer applies. Use the rebased copy from ci-patches/.
+          #    (Do NOT just delete it: device/phh/treble defines the macro as a function
+          #    call, which cannot be used in a preprocessor #if.)
+          NAME="0001-Make-BTM_BYPASS_EXTRA_ACL_SETUP-dynamic.patch"
+          SRC="$GITHUB_WORKSPACE/ci/ci-patches/platform_system_bt/$NAME"
+          DST="treble_patches/patches/platform_system_bt/$NAME"
+          test -f "$SRC" || { echo "::error::Missing ci-patches/platform_system_bt/$NAME in your repo"; exit 1; }
+          test -f "$DST" || { echo "::error::Upstream no longer has $DST - re-check the patch set"; exit 1; }
+          cp "$SRC" "$DST"
+
+          # 2) microG: upstream LineageOS 17.1 now ships its own signature spoofing for
+          #    microG, so Andy's older patch conflicts with it (and would define
+          #    MICROG_FAKE_SIGNATURE twice). Skip it.
+          SCRIPT=treble_build_los/buildbot_treble.sh
+          grep -q 'Allow-selective-signature-spoofing-for-microG' "$SCRIPT" \
+            || echo "::warning::microG patch line not found in $SCRIPT (already removed upstream?)"
+          sed -i '/Allow-selective-signature-spoofing-for-microG/d' "$SCRIPT"
+          bash -n "$SCRIPT"
 
       - name: Select target variant
         run: |
