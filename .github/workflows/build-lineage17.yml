@@ -90,7 +90,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
-            git gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \
+            git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \
             lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev \
             libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
             squashfs-tools xsltproc zip zlib1g-dev python3 python2 xz-utils
@@ -98,6 +98,13 @@ jobs:
           # Android 10 expects `python` to be Python 2 (do NOT use python-is-python3)
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           python --version
+
+          # `repo init --git-lfs` (below) needs git-lfs plus its filter in the global git config.
+          # LineageOS 17.1 now stores the WebView prebuilts in Git LFS; without this you get
+          # 133-byte text pointers instead of the real .apk files.
+          git lfs install --skip-repo
+          git lfs version
+          sudo apt-get clean
 
           mkdir -p "$HOME/bin"
           curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
@@ -141,7 +148,9 @@ jobs:
           if [ "${{ inputs.partial_clone }}" = "true" ]; then
             EXTRA="--partial-clone"
           fi
-          repo init -u https://github.com/LineageOS/android.git -b lineage-17.1 $EXTRA < /dev/null
+          # --git-lfs is required: without it `repo` deliberately configures git to SKIP LFS
+          # downloads, so external/chromium-webview/prebuilt/*/webview.apk stays a text pointer.
+          repo init -u https://github.com/LineageOS/android.git -b lineage-17.1 --git-lfs $EXTRA < /dev/null
 
           # Directory names are what buildbot_treble.sh expects
           git clone https://github.com/AndyCGYan/treble_patches -b lineage-17.1 treble_patches
@@ -188,16 +197,52 @@ jobs:
           echo "Variant calls in the script:"
           grep -n '^buildVariant' buildbot_treble.sh
 
-      - name: Free .repo before compiling
-        if: ${{ inputs.free_repo_dir }}
+      - name: Add pre-build checks (and optional .repo removal) to the build script
         run: |
           cd "$GITHUB_WORKSPACE/lineage/treble_build_los"
-          # buildbot_treble.sh patches inline (there is no applyPatches function), and the
-          # patching ends right before this line, so .repo can go just before compiling.
+
+          # This runs inside buildbot_treble.sh after sync + patching and right before
+          # compiling, so a problem shows up ~30 minutes in instead of after ~5 hours.
+          cat > ci_precheck.sh <<'EOF'
+          #!/bin/bash
+          set -e
+          shopt -s nullglob
+          files=(external/chromium-webview/prebuilt/*/webview.apk)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "ERROR: no external/chromium-webview/prebuilt/*/webview.apk found - did repo sync fail?"
+            exit 1
+          fi
+          bad=0
+          for f in "${files[@]}"; do
+            size=$(stat -c %s "$f")
+            echo "webview check: $f = $size bytes"
+            if [ "$size" -lt 10000000 ]; then
+              echo "ERROR: $f is a Git LFS pointer, not the real APK:"
+              head -c 200 "$f"; echo
+              bad=1
+            fi
+          done
+          [ "$bad" = 0 ] || { echo "Git LFS files were not downloaded during repo sync."; exit 1; }
+          EOF
+
+          if [ "${{ inputs.free_repo_dir }}" = "true" ]; then
+            # The compile never reads .repo (checked against lineage-17.1 build/soong/make).
+            # The real WebView files are already in the work tree at this point.
+            {
+              echo 'echo "Freeing .repo:"; du -sh .repo || true'
+              echo 'rm -rf .repo'
+              echo 'df -h . | cat'
+            } >> ci_precheck.sh
+          fi
+          bash -n ci_precheck.sh
+
+          # buildbot_treble.sh patches inline (there is no applyPatches function); the patching
+          # ends right before this line. $BL is defined at the top of that script.
           grep -q '^export WITHOUT_CHECK_API=true' buildbot_treble.sh \
             || { echo "::error::anchor line not found in buildbot_treble.sh"; exit 1; }
-          sed -i '/^export WITHOUT_CHECK_API=true/i echo "Freeing .repo:"; du -sh .repo; rm -rf .repo; df -h .' buildbot_treble.sh
+          sed -i '/^export WITHOUT_CHECK_API=true/i bash "$BL/ci_precheck.sh"' buildbot_treble.sh
           bash -n buildbot_treble.sh
+          grep -n 'ci_precheck' buildbot_treble.sh
 
       - name: Sync, patch and build
         timeout-minutes: 330 # leave time for the cache save below if this is cut off
@@ -217,18 +262,22 @@ jobs:
               echo "[monitor $(date +%H:%M)]"; df -h / "$GITHUB_WORKSPACE" | cat; free -h | sed -n 1,3p
             done ) &
           MONITOR=$!
-          trap 'kill $MONITOR 2>/dev/null || true' EXIT
+          trap 'kill $MONITOR 2>/dev/null || true; echo "[ccache stats]"; ccache -s | cat || true' EXIT
 
           export CCACHE_EXEC="$(command -v ccache)"
           ccache -M 4G
           bash treble_build_los/buildbot_treble.sh
 
-      - name: Save ccache
-        if: ${{ always() }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}/.ccache
-          key: ccache-lineage17-${{ inputs.variant }}-${{ github.run_id }}
+      - name: Free out/ before packaging
+        if: ${{ success() }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          # buildbot_treble.sh already moved the finished image(s) into build-output/
+          ls build-output/lineage-*.img >/dev/null 2>&1 \
+            || { echo "::error::No lineage-*.img in build-output/ - the build produced no image"; exit 1; }
+          df -h . | cat
+          rm -rf lineage/out
+          df -h . | cat
 
       - name: Compress images and write checksums
         run: |
@@ -262,3 +311,39 @@ jobs:
           files: |
             dist/*.img.xz
             dist/SHA256SUMS.txt
+
+      # The cache is saved LAST on purpose: it needs a multi-GB archive on the small root disk,
+      # and a full disk there must never be able to cost you the finished image above.
+      - name: Trim ccache so its archive fits on the root disk
+        id: ccache
+        if: ${{ always() }}
+        run: |
+          # Each path below writes `save` exactly once; if this step fails midway the output
+          # stays unset, which the Save step treats as "do not save".
+          command -v ccache >/dev/null && [ -d "$CCACHE_DIR" ] \
+            || { echo "No ccache to save"; echo "save=false" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          # actions/cache writes its archive into RUNNER_TEMP, which lives on the root disk
+          FREE_MB=$(df -BM --output=avail "$RUNNER_TEMP" | tail -1 | tr -dc '0-9')
+          LIMIT_MB=$(( FREE_MB - 2048 ))
+          [ "$LIMIT_MB" -gt 4096 ] && LIMIT_MB=4096
+          echo "Root disk free: ${FREE_MB} MB -> ccache limit: ${LIMIT_MB} MB"
+          df -h / "$RUNNER_TEMP" "$GITHUB_WORKSPACE" | cat
+
+          if [ "$LIMIT_MB" -lt 512 ]; then
+            echo "::warning::Not enough free space on the root disk for a useful ccache archive; skipping the cache save"
+            echo "save=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ccache -M "${LIMIT_MB}M"
+          ccache -c
+          ccache -s | cat
+          du -sh "$CCACHE_DIR"
+          echo "save=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save ccache
+        if: ${{ always() && steps.ccache.outputs.save == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-lineage17-${{ inputs.variant }}-${{ github.run_id }}
