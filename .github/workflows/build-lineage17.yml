@@ -65,7 +65,7 @@ jobs:
       GOGC: '50' # more frequent Go GC: lowers soong_build peak memory (costs a little CPU)
       # Max ccache size in MB. The cache itself lives on the big build volume; what must fit on the
       # small root disk is the archive that actions/cache builds when saving it (see the Trim step).
-      GSI_CCACHE_MB: '3000'
+      GSI_CCACHE_MB: '4096'
 
     steps:
       - name: Maximize build space
