@@ -82,6 +82,24 @@ jobs:
           remove-codeql: 'true'
           remove-docker-images: 'true'
 
+      - name: Enable zswap (if the kernel supports it)
+        run: |
+          P=/sys/module/zswap/parameters
+          if [ ! -d "$P" ]; then
+            echo "::warning::zswap not available in kernel $(uname -r); skipping"
+            exit 0
+          fi
+          set_param() { echo "$2" | sudo tee "$P/$1" >/dev/null 2>&1 || echo "::warning::could not set zswap $1=$2"; }
+          sudo modprobe lz4 2>/dev/null || true
+          set_param compressor lz4
+          if [ -e "$P/zpool" ]; then sudo modprobe zsmalloc 2>/dev/null || true; set_param zpool zsmalloc; fi
+          set_param max_pool_percent 25
+          set_param enabled 1
+          for f in enabled compressor zpool max_pool_percent; do
+            [ -e "$P/$f" ] && echo "zswap $f = $(cat $P/$f)"
+          done
+          swapon --show
+
       - name: Checkout this repo (for ci-patches/)
         uses: actions/checkout@v4
         with:
