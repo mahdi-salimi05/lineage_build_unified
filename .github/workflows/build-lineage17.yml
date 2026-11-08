@@ -63,6 +63,9 @@ jobs:
       CCACHE_COMPRESS: '1'
       LC_ALL: C
       GOGC: '50' # more frequent Go GC: lowers soong_build peak memory (costs a little CPU)
+      # Max ccache size in MB. The cache itself lives on the big build volume; what must fit on the
+      # small root disk is the archive that actions/cache builds when saving it (see the Trim step).
+      GSI_CCACHE_MB: '1024'
 
     steps:
       - name: Maximize build space
@@ -283,7 +286,7 @@ jobs:
           trap 'kill $MONITOR 2>/dev/null || true; echo "[ccache stats]"; ccache -s | cat || true' EXIT
 
           export CCACHE_EXEC="$(command -v ccache)"
-          ccache -M 4G
+          ccache -M "${GSI_CCACHE_MB}M"
           bash treble_build_los/buildbot_treble.sh
 
       - name: Free out/ before packaging
@@ -332,16 +335,6 @@ jobs:
 
       # The cache is saved LAST on purpose: it needs a multi-GB archive on the small root disk,
       # and a full disk there must never be able to cost you the finished image above.
-      - name: Report what is using the root disk
-        if: ${{ always() }}
-        run: |
-          # Root had only ~1.7 GB left at the end of the last run (about 8 GB of the 10 GB reserve
-          # was used by something). This shows the biggest directories on the root filesystem
-          # (the build volume is a separate mount and the LVM image file is excluded).
-          df -h / "$GITHUB_WORKSPACE" | cat
-          sudo du -xk --max-depth=2 --exclude=pv.img / 2>/dev/null | sort -n | tail -25 \
-            | awk '{ printf "%9.1f MB  %s\n", $1/1024, $2 }' || true
-
       - name: Trim ccache so its archive fits on the root disk
         id: ccache
         if: ${{ always() }}
@@ -351,10 +344,16 @@ jobs:
           command -v ccache >/dev/null && [ -d "$CCACHE_DIR" ] \
             || { echo "No ccache to save"; echo "save=false" >> "$GITHUB_OUTPUT"; exit 0; }
 
-          # actions/cache writes its archive into RUNNER_TEMP, which lives on the root disk
+          # The root disk had only ~1.7 GB free at the end of the last runs. Free ~4 GB of it first:
+          # /opt/hostedtoolcache holds the runner image's preinstalled Python/Node/Ruby/... versions
+          # for setup-* actions. This job never uses them (checkout, cache, upload and release run
+          # on the runner's own node), and no step after this one needs them either.
+          sudo rm -rf /opt/hostedtoolcache || true
+
+          # actions/cache builds its archive in RUNNER_TEMP, which lives on the root disk
           FREE_MB=$(df -BM --output=avail "$RUNNER_TEMP" | tail -1 | tr -dc '0-9')
-          LIMIT_MB=$(( FREE_MB - 2048 ))
-          [ "$LIMIT_MB" -gt 4096 ] && LIMIT_MB=4096
+          LIMIT_MB=$(( FREE_MB - 768 ))   # leave ~768 MB for the runner itself
+          [ "$LIMIT_MB" -gt "$GSI_CCACHE_MB" ] && LIMIT_MB=$GSI_CCACHE_MB
           echo "Root disk free: ${FREE_MB} MB -> ccache limit: ${LIMIT_MB} MB"
           df -h / "$RUNNER_TEMP" "$GITHUB_WORKSPACE" | cat
 
