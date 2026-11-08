@@ -305,7 +305,28 @@ jobs:
 
           export CCACHE_EXEC="$(command -v ccache)"
           ccache -M "${GSI_CCACHE_MB}M"
-          bash treble_build_los/buildbot_treble.sh
+
+          # Create the filter script without any quoting issues
+          cat << 'EOF' > filter.awk
+          BEGIN { last_pct = -1 }
+          /^\[ *[0-9]+%/ {
+            pct = $0
+            sub(/^\[ */, "", pct)
+            sub(/%.*/, "", pct)
+            pct += 0
+            if (pct != last_pct) {
+              last_pct = pct
+              print substr($0, 1, index($0, "]"))
+              fflush()
+            }
+            next
+          }
+          { print; fflush() }
+          EOF
+
+          # Run buildbot and pipe through the filter file
+          bash treble_build_los/buildbot_treble.sh 2>&1 | awk -f filter.awk
+
 
       - name: Free out/ before packaging
         if: ${{ success() }}
