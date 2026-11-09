@@ -75,7 +75,7 @@ jobs:
           # its archive before upload, so it needs more than a few GB of headroom.
           root-reserve-mb: 10240
           temp-reserve-mb: 512
-          swap-size-mb: 512
+          swap-size-mb: 768
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
