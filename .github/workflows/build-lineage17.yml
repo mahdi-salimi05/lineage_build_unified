@@ -15,24 +15,18 @@ on:
   workflow_dispatch:
     inputs:
       variant:
-        description: 'GSI variant to build (a/b = A-only / A-B, v = vanilla, N = no su, S = with PHH su)'
+        description: 'GSI variant to build (a/b = A-only / A-B, v = vanilla, N = no su; the PHH-su "S" variants are not offered)'
         required: true
         default: 'treble_arm64_bvN'
         type: choice
         options:
           - treble_arm64_bvN   # ARM64, A/B, vanilla
-          - treble_arm64_bvS   # ARM64, A/B, vanilla + su
           - treble_arm64_avN   # ARM64, A-only, vanilla
-          - treble_arm64_avS
           - treble_a64_bvN     # ARM32 userspace + 64-bit binder, A/B
-          - treble_a64_bvS
           - treble_a64_avN
-          - treble_a64_avS
           - treble_arm_bvN     # ARM32, A/B
-          - treble_arm_bvS
           - treble_arm_avN     # ARM32, A-only
-          - treble_arm_avS
-          - all                # The script's own list: all six archs, S variants (needs a very large runner)
+          - all                # The script's own list, switched to the N variants: all six archs (needs a very large runner)
       partial_clone:
         description: 'Use a git partial clone for repo sync (saves disk; turn off if the sync fails)'
         required: false
@@ -237,6 +231,26 @@ jobs:
           bash -n buildbot_treble.sh
           echo "Variant calls in the script:"
           grep -n '^buildVariant' buildbot_treble.sh
+
+      - name: Make it a user build without su
+        run: |
+          cd "$GITHUB_WORKSPACE/lineage/treble_build_los"
+          S=buildbot_treble.sh
+
+          # No root: Lineage's su (WITH_SU) and phh-su (only in the *vS variants) are both off.
+          # vendor/lineage only adds su to non-user builds anyway; this makes it explicit.
+          sed -i 's/^export WITH_SU=true$/export WITH_SU=false/' "$S"
+          # `all` builds the script's own list, which is the six *vS variants -> use *vN instead
+          sed -i -E 's/^(buildVariant treble_[a-z0-9]+_[ab]v)S$/\1N/' "$S"
+          # userdebug -> user (ro.debuggable=0, no adb root, no userdebug-only sepolicy)
+          sed -i 's/lunch \${1}-userdebug/lunch ${1}-user/' "$S"
+
+          grep -q '^export WITH_SU=false$' "$S"   || { echo "::error::could not set WITH_SU=false"; exit 1; }
+          grep -q 'lunch \${1}-user$' "$S"        || { echo "::error::could not switch lunch to -user"; exit 1; }
+          ! grep -q 'userdebug' "$S"              || { echo "::error::userdebug still referenced"; exit 1; }
+          ! grep -E '^buildVariant .*vS$' "$S"    || { echo "::error::an S (phh-su) variant is still being built"; exit 1; }
+          bash -n "$S"
+          grep -n 'WITH_SU\|lunch\|^buildVariant' "$S"
 
       - name: Add pre-build checks (and optional .repo removal) to the build script
         run: |
