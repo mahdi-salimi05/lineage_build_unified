@@ -324,6 +324,10 @@ jobs:
           { print; fflush() }
           EOF
 
+          # pipefail: without it the step exits with awk's status (0) and a failed
+          # build would look green, then compress/release would run on nothing.
+          set -o pipefail
+
           # Run buildbot and pipe through the filter file
           bash treble_build_los/buildbot_treble.sh 2>&1 | awk -f filter.awk
 
