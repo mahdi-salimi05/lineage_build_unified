@@ -100,6 +100,19 @@ jobs:
           done
           swapon --show
 
+      - name: Disable systemd-oomd (userspace OOM killer)
+        run: |
+          # systemd-oomd kills whole cgroups on sustained memory *pressure* (PSI), which a
+          # swap-heavy link step can trigger long before the kernel is actually out of memory.
+          # Mask both units: the .socket would otherwise re-activate the .service.
+          echo "Before:"; systemctl list-unit-files 'systemd-oomd*' --no-legend 2>/dev/null || true
+          sudo systemctl disable --now systemd-oomd.service systemd-oomd.socket 2>/dev/null || true
+          sudo systemctl mask systemd-oomd.service systemd-oomd.socket 2>/dev/null || true
+          echo "After:"
+          for u in systemd-oomd.service systemd-oomd.socket; do
+            echo "$u: enabled=$(systemctl is-enabled "$u" 2>&1 | head -1) active=$(systemctl is-active "$u" 2>&1 | head -1)"
+          done
+
       - name: Checkout this repo (for ci-patches/)
         uses: actions/checkout@v4
         with:
