@@ -76,6 +76,23 @@ jobs:
           remove-codeql: 'true'
           remove-docker-images: 'true'
 
+      # actions/cache downloads its archive (~2.7 GB for this ccache) into RUNNER_TEMP, which is on
+      # the small ROOT disk, and that disk had only ~1.7 GB free here -> "ENOSPC" at 80%, no cache
+      # restored, cold build. Free the runner image's preinstalled toolcache BEFORE the restore.
+      # (Raising root-reserve-mb instead would shrink the build volume 1:1, and that one is tight.)
+      - name: Free root disk space for the cache download
+        run: |
+          df -h / | cat
+          # Only delete it if nothing this job uses lives in there
+          for t in git python3 tar zstd curl xz; do
+            p=$(command -v "$t" || true)
+            case "$p" in
+              /opt/hostedtoolcache/*) echo "::warning::$t resolves to $p - keeping /opt/hostedtoolcache"; exit 0 ;;
+            esac
+          done
+          sudo rm -rf /opt/hostedtoolcache
+          df -h / | cat
+
       - name: Enable zswap (if the kernel supports it)
         run: |
           P=/sys/module/zswap/parameters
@@ -414,10 +431,8 @@ jobs:
           command -v ccache >/dev/null && [ -d "$CCACHE_DIR" ] \
             || { echo "No ccache to save"; echo "save=false" >> "$GITHUB_OUTPUT"; exit 0; }
 
-          # The root disk had only ~1.7 GB free at the end of the last runs. Free ~4 GB of it first:
-          # /opt/hostedtoolcache holds the runner image's preinstalled Python/Node/Ruby/... versions
-          # for setup-* actions. This job never uses them (checkout, cache, upload and release run
-          # on the runner's own node), and no step after this one needs them either.
+          # /opt/hostedtoolcache was already removed by the "Free root disk space" step near the top
+          # (this is a harmless no-op safety net if that step skipped it).
           sudo rm -rf /opt/hostedtoolcache || true
 
           # actions/cache builds its archive in RUNNER_TEMP, which lives on the root disk
