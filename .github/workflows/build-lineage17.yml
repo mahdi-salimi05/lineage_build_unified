@@ -68,20 +68,6 @@ jobs:
       GSI_CCACHE_MB: '4096'
 
     steps:
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          # Root keeps the OS, apt packages and the temp dir where actions/cache writes
-          # its archive before upload, so it needs more than a few GB of headroom.
-          root-reserve-mb: 6144
-          temp-reserve-mb: 512
-          swap-size-mb: 8192
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-
       # actions/cache downloads its archive (~2.7 GB for this ccache) into RUNNER_TEMP, which is on
       # the small ROOT disk, and that disk had only ~1.7 GB free here -> "ENOSPC" at 80%, no cache
       # restored, cold build. Free the runner image's preinstalled toolcache BEFORE the restore.
@@ -98,6 +84,20 @@ jobs:
           done
           sudo rm -rf /opt/hostedtoolcache
           df -h / | cat
+
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          # Root keeps the OS, apt packages and the temp dir where actions/cache writes
+          # its archive before upload, so it needs more than a few GB of headroom.
+          root-reserve-mb: 6144
+          temp-reserve-mb: 512
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
 
       - name: Enable zswap (if the kernel supports it)
         run: |
