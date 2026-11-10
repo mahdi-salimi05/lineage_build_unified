@@ -413,28 +413,22 @@ jobs:
 
       # The cache is saved LAST on purpose: it needs a multi-GB archive on the small root disk,
       # and a full disk there must never be able to cost you the finished image above.
-      - name: Trim ccache so its archive fits on the root disk
+      - name: Trim ccache so its archive fits on disk
         id: ccache
         if: ${{ always() }}
         run: |
-          # Each path below writes `save` exactly once; if this step fails midway the output
-          # stays unset, which the Save step treats as "do not save".
           command -v ccache >/dev/null && [ -d "$CCACHE_DIR" ] \
             || { echo "No ccache to save"; echo "save=false" >> "$GITHUB_OUTPUT"; exit 0; }
 
-          # /opt/hostedtoolcache was already removed by the "Free root disk space" step near the top
-          # (this is a harmless no-op safety net if that step skipped it).
-          sudo rm -rf /opt/hostedtoolcache || true
-
-          # actions/cache builds its archive in RUNNER_TEMP, which lives on the root disk
+          # Check available space on RUNNER_TEMP (now backed by the 90GB volume)
           FREE_MB=$(df -BM --output=avail "$RUNNER_TEMP" | tail -1 | tr -dc '0-9')
-          LIMIT_MB=$(( FREE_MB - 768 ))   # leave ~768 MB for the runner itself
+          LIMIT_MB=$(( FREE_MB - 2048 ))
           [ "$LIMIT_MB" -gt "$GSI_CCACHE_MB" ] && LIMIT_MB=$GSI_CCACHE_MB
-          echo "Root disk free: ${FREE_MB} MB -> ccache limit: ${LIMIT_MB} MB"
-          df -h / "$RUNNER_TEMP" "$GITHUB_WORKSPACE" | cat
+          echo "Disk free: ${FREE_MB} MB -> ccache limit: ${LIMIT_MB} MB"
+          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
 
           if [ "$LIMIT_MB" -lt 512 ]; then
-            echo "::warning::Not enough free space on the root disk for a useful ccache archive; skipping the cache save"
+            echo "::warning::Not enough free space; skipping cache save"
             echo "save=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
