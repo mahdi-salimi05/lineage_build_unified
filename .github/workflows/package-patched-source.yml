@@ -1,0 +1,327 @@
+name: Package patched LineageOS 17.1 source
+
+# Syncs LineageOS 17.1, applies every patch that buildbot_treble.sh applies (PHH treble, FOD
+# reverts, universal and GSI patches, plus the rebased system/bt patch from ci-patches/), stops
+# BEFORE compiling, compresses the tree with zstd and publishes it as GitHub Release assets.
+#
+# Save as: .github/workflows/package-patched-source.yml
+# Needs ci-patches/platform_system_bt/0001-Make-BTM_BYPASS_EXTRA_ACL_SETUP-dynamic.patch in your repo
+# (the same file build-lineage17.yml uses).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag prefix (the run id is appended, so re-runs never collide)'
+        required: true
+        default: 'lineage-17.1-patched-source'
+        type: string
+      zstd_level:
+        description: 'zstd level. 19 = high (~2 h for ~45 GB on 4 cores). 22 = absolute maximum but ~2.3x slower for <1% smaller; will probably exceed the 6 h limit'
+        required: true
+        default: '19'
+        type: choice
+        options:
+          - '19'
+          - '15'
+          - '22'
+      partial_clone:
+        description: 'Use a git partial clone for repo sync (saves disk; turn off if the sync fails)'
+        required: false
+        default: true
+        type: boolean
+      free_repo_dir:
+        description: 'Leave .repo out of the archive (saves ~20-35 GB; the compile does not need it, but you cannot `repo sync` the extracted tree)'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  package:
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-22.04' }}
+    timeout-minutes: 360 # maximum for GitHub-hosted runners
+    permissions:
+      contents: write # creates the release
+
+    env:
+      LC_ALL: C
+      ARCHIVE: lineage-17.1-patched-source.tar.zst
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          # The tree and the archive parts both live on the big build volume; root only needs
+          # room for the OS and apt packages.
+          root-reserve-mb: 10240
+          temp-reserve-mb: 512
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Free root disk space
+        run: |
+          df -h / | cat
+          # Only delete the runner image's toolcache if nothing this job uses lives in there
+          for t in git python3 tar zstd curl xz; do
+            p=$(command -v "$t" || true)
+            case "$p" in
+              /opt/hostedtoolcache/*) echo "::warning::$t resolves to $p - keeping /opt/hostedtoolcache"; exit 0 ;;
+            esac
+          done
+          sudo rm -rf /opt/hostedtoolcache
+          df -h / | cat
+
+      - name: Checkout this repo (for ci-patches/)
+        uses: actions/checkout@v4
+        with:
+          path: ci
+          sparse-checkout: ci-patches
+
+      - name: Install build dependencies and repo
+        run: |
+          # Same package list as build-lineage17.yml (so the patch phase runs in the identical
+          # environment) plus zstd and patch (apply-patches.sh calls it).
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev \
+            lib32z1-dev liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev \
+            libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev python3 python2 xz-utils \
+            zstd patch
+
+          sudo ln -sf /usr/bin/python2 /usr/bin/python
+          python --version
+          zstd --version
+
+          # LineageOS 17.1 keeps the WebView prebuilts in Git LFS
+          git lfs install --skip-repo
+          git lfs version
+          sudo apt-get clean
+
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configure git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+          git config --global core.compression 0
+
+      - name: Fetch treble_experimentations
+        run: |
+          # buildbot_treble.sh calls ~/treble_experimentations/apply-patches.sh
+          git clone --depth=1 https://github.com/AndyCGYan/treble_experimentations "$HOME/treble_experimentations"
+
+      - name: Initialize workspace
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/lineage" "$GITHUB_WORKSPACE/dist"
+          cd "$GITHUB_WORKSPACE/lineage"
+
+          # No --depth=1: the script runs `git revert <sha>` on several projects.
+          EXTRA=""
+          if [ "${{ inputs.partial_clone }}" = "true" ]; then
+            EXTRA="--partial-clone"
+          fi
+          # --git-lfs: without it repo configures git to SKIP LFS, leaving webview.apk a text pointer
+          repo init -u https://github.com/LineageOS/android.git -b lineage-17.1 --git-lfs $EXTRA < /dev/null
+
+          git clone https://github.com/AndyCGYan/treble_patches -b lineage-17.1 treble_patches
+          git clone https://github.com/AndyCGYan/lineage_build_unified -b lineage-17.1 treble_build_los
+
+      - name: Fix patches that drifted from current LineageOS 17.1
+        run: |
+          cd "$GITHUB_WORKSPACE/lineage"
+
+          # 1) rebased system/bt patch (the original no longer applies; see build-lineage17.yml)
+          NAME="0001-Make-BTM_BYPASS_EXTRA_ACL_SETUP-dynamic.patch"
+          SRC="$GITHUB_WORKSPACE/ci/ci-patches/platform_system_bt/$NAME"
+          DST="treble_patches/patches/platform_system_bt/$NAME"
+          test -f "$SRC" || { echo "::error::Missing ci-patches/platform_system_bt/$NAME in your repo"; exit 1; }
+          test -f "$DST" || { echo "::error::Upstream no longer has $DST - re-check the patch set"; exit 1; }
+          cp "$SRC" "$DST"
+
+          # 2) microG: upstream LineageOS 17.1 ships its own signature spoofing now; skip Andy's patch
+          SCRIPT=treble_build_los/buildbot_treble.sh
+          grep -q 'Allow-selective-signature-spoofing-for-microG' "$SCRIPT" \
+            || echo "::warning::microG patch line not found in $SCRIPT (already removed upstream?)"
+          sed -i '/Allow-selective-signature-spoofing-for-microG/d' "$SCRIPT"
+          bash -n "$SCRIPT"
+
+      - name: Make the build script stop after patching
+        run: |
+          cd "$GITHUB_WORKSPACE/lineage/treble_build_los"
+
+          # Checks that run inside buildbot_treble.sh once everything is patched. They also make
+          # the tree itself correct, since the archive is a snapshot of it.
+          cat > ci_precheck.sh <<'EOF'
+          #!/bin/bash
+          set -e
+          shopt -s nullglob
+          files=(external/chromium-webview/prebuilt/*/webview.apk)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "ERROR: no external/chromium-webview/prebuilt/*/webview.apk found - did repo sync fail?"
+            exit 1
+          fi
+          bad=0
+          for f in "${files[@]}"; do
+            size=$(stat -c %s "$f")
+            echo "webview check: $f = $size bytes"
+            if [ "$size" -lt 10000000 ]; then
+              echo "ERROR: $f is a Git LFS pointer, not the real APK:"
+              head -c 200 "$f"; echo
+              bad=1
+            fi
+          done
+          [ "$bad" = 0 ] || { echo "Git LFS files were not downloaded during repo sync."; exit 1; }
+
+          # LineageOS 17.1 has VNDK mapping files only up to 29.0.cil; skip the VNDK 30 test
+          # (baked into the tree so builds from the archive do not need the workaround)
+          if grep -q '^for vndk in 28 29 30;do$' vendor/vndk-tests/run.sh 2>/dev/null; then
+            sed -i '/^for vndk in 28 29 30;do$/a\    [ -f "$2"/system/etc/selinux/mapping/${vndk}.0.cil ] || continue' vendor/vndk-tests/run.sh
+            echo "vndk-tests: run.sh now skips VNDK versions that have no mapping file"
+          else
+            echo "WARNING: vendor/vndk-tests/run.sh is not in the expected shape; left unpatched"
+          fi
+          EOF
+          bash -n ci_precheck.sh
+
+          # In buildbot_treble.sh the patching ends right before `export WITHOUT_CHECK_API=true`.
+          # Insert (in this order): the checks, then a marker + clean exit.
+          grep -q '^export WITHOUT_CHECK_API=true' buildbot_treble.sh \
+            || { echo "::error::anchor line not found in buildbot_treble.sh"; exit 1; }
+          sed -i '/^export WITHOUT_CHECK_API=true/i bash "$BL/ci_precheck.sh"' buildbot_treble.sh
+          sed -i '/^export WITHOUT_CHECK_API=true/i echo "=== all patches applied - stopping before the build ==="; date -u > "$PWD/.ci_patches_applied"; exit 0' buildbot_treble.sh
+          bash -n buildbot_treble.sh
+          grep -n -B1 -A1 'ci_precheck\|ci_patches_applied' buildbot_treble.sh
+
+      - name: Sync and apply patches
+        timeout-minutes: 150
+        run: |
+          cd "$GITHUB_WORKSPACE/lineage"
+          bash treble_build_los/buildbot_treble.sh
+          # The script ends with `exit 0` right after the patches; make sure it got that far
+          test -f .ci_patches_applied || { echo "::error::the script did not reach the end of the patch phase"; exit 1; }
+          df -h "$GITHUB_WORKSPACE" | cat
+
+      - name: Write build notes into the tree and drop .repo
+        run: |
+          cd "$GITHUB_WORKSPACE/lineage"
+          {
+            echo "Patched LineageOS 17.1 source (Android 10), patches applied, NOT compiled."
+            echo "Packaged:               $(date -u +%FT%TZ)"
+            echo "Workflow run:           ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "treble_patches:         $(git -C treble_patches rev-parse HEAD)"
+            echo "lineage_build_unified:  $(git -C treble_build_los rev-parse HEAD)"
+            echo ".repo included:         ${{ inputs.free_repo_dir == false }}"
+            echo
+            echo "Build (do NOT run treble_build_los/buildbot_treble.sh - it syncs and patches again):"
+            echo "  source build/envsetup.sh"
+            echo "  export WITHOUT_CHECK_API=true"
+            echo "  lunch treble_arm64_bvN-userdebug     # or -user; N = no su, S = phh-su (set WITH_SU=true for S)"
+            echo "  make -j\$(nproc) systemimage"
+          } > BUILD-INFO.txt
+          cat BUILD-INFO.txt
+
+          if [ "${{ inputs.free_repo_dir }}" = "true" ]; then
+            echo "Removing .repo:"; du -sh .repo || true
+            rm -rf .repo
+          fi
+          rm -rf "$GITHUB_WORKSPACE/ci"
+          du -sh . | cat
+          df -h "$GITHUB_WORKSPACE" | cat
+
+      - name: Compress with zstd and split for GitHub Releases
+        timeout-minutes: 240
+        run: |
+          # Without pipefail a failing tar/zstd would still exit 0 and a truncated archive
+          # would get published.
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE"
+          LEVEL="${{ inputs.zstd_level }}"
+          ULTRA=""; [ "$LEVEL" -gt 19 ] && ULTRA="--ultra"
+
+          # Progress heartbeat (zstd's own progress output is noise in a CI log)
+          ( while true; do
+              sleep 300
+              echo "[$(date +%H:%M)] compressed so far: $(du -sh dist | cut -f1)"
+            done ) &
+          HB=$!
+          trap 'kill $HB 2>/dev/null || true' EXIT
+
+          echo "zstd level $LEVEL, window 128 MiB (--long=27: plain 'zstd -d' reads it, no flags needed)"
+          # Streaming: the uncompressed tar never touches the disk. GitHub allows < 2 GiB per
+          # release asset, so cut into 1900 MiB parts.
+          tar -cf - lineage \
+            | zstd -T0 $ULTRA -"$LEVEL" --long=27 -q \
+            | split -b 1900M -d -a 2 - "dist/$ARCHIVE.part"
+
+          ls -l dist
+          df -h "$GITHUB_WORKSPACE" | cat
+
+      - name: Verify the archive and write checksums
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/dist"
+          # Decompress the whole thing and walk the tar structure: catches a truncated or
+          # corrupt archive before anything is published.
+          # (list to a file: `grep -q` in the pipe would exit early and SIGPIPE tar under pipefail)
+          cat "$ARCHIVE".part* | zstd -dc | tar -tf - > "$RUNNER_TEMP/archive.list"
+          echo "Entries in archive: $(wc -l < "$RUNNER_TEMP/archive.list")"
+          grep -qx 'lineage/BUILD-INFO.txt' "$RUNNER_TEMP/archive.list" \
+            || { echo "::error::BUILD-INFO.txt not found in the archive"; exit 1; }
+          grep -qx 'lineage/.ci_patches_applied' "$RUNNER_TEMP/archive.list" \
+            || { echo "::error::patch marker not found in the archive"; exit 1; }
+          sha256sum "$ARCHIVE".part* | tee SHA256SUMS.txt
+          for f in "$ARCHIVE".part*; do
+            [ "$(stat -c %s "$f")" -lt 2147483648 ] || { echo "::error::$f is 2 GiB or more"; exit 1; }
+          done
+
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd "$GITHUB_WORKSPACE/dist"
+          TAG="${{ inputs.release_tag }}-${{ github.run_id }}"
+
+          {
+            echo "## Patched LineageOS 17.1 source (patches applied, not compiled)"
+            echo
+            echo "Everything \`buildbot_treble.sh\` applies is already in this tree. Packaged with zstd level ${{ inputs.zstd_level }} and split into parts below the 2 GiB per-asset limit."
+            echo
+            echo '```bash'
+            echo "gh release download $TAG -R $GH_REPO -p '*.part*' -p SHA256SUMS.txt"
+            echo "sha256sum -c SHA256SUMS.txt"
+            echo "cat $ARCHIVE.part* | zstd -dc | tar -xf -     # creates ./lineage"
+            echo '```'
+            echo
+            echo 'Extract onto a case-sensitive filesystem with ~50 GB free. See `lineage/BUILD-INFO.txt` for the build commands.'
+            echo
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+
+          # Draft first: the release only goes public once every part is uploaded
+          gh release create "$TAG" --draft --target "$GITHUB_SHA" \
+            --title "LineageOS 17.1 patched source ($TAG)" --notes-file "$RUNNER_TEMP/notes.md"
+
+          for f in "$ARCHIVE".part* SHA256SUMS.txt; do
+            for try in 1 2 3; do
+              echo "Uploading $f (attempt $try)"
+              gh release upload "$TAG" "$f" --clobber && break
+              [ "$try" = 3 ] && { echo "::error::upload of $f failed 3 times"; exit 1; }
+              sleep 30
+            done
+          done
+
+          gh release edit "$TAG" --draft=false
+          { echo "### Published \`$TAG\`"; echo; ls -lh "$ARCHIVE".part* | awk '{print "- " $9 " (" $5 ")"}'; } >> "$GITHUB_STEP_SUMMARY"
