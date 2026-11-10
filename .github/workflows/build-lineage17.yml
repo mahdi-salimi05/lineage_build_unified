@@ -85,7 +85,7 @@ jobs:
         with:
           root-reserve-mb: 4608
           temp-reserve-mb: 512
-          swap-size-mb: 8192
+          swap-size-mb: 7192
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
@@ -118,8 +118,8 @@ jobs:
             exit 0
           fi
           set_param() { echo "$2" | sudo tee "$P/$1" >/dev/null 2>&1 || echo "::warning::could not set zswap $1=$2"; }
-          sudo modprobe lz4 2>/dev/null || true
-          set_param compressor lz4
+          sudo modprobe zstd 2>/dev/null || true
+          set_param compressor zstd
           if [ -e "$P/zpool" ]; then sudo modprobe zsmalloc 2>/dev/null || true; set_param zpool zsmalloc; fi
           set_param max_pool_percent 25
           set_param enabled 1
