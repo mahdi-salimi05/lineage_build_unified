@@ -75,7 +75,7 @@ jobs:
           # its archive before upload, so it needs more than a few GB of headroom.
           root-reserve-mb: 10240
           temp-reserve-mb: 512
-          swap-size-mb: 2048
+          swap-size-mb: 10
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
@@ -323,7 +323,7 @@ jobs:
           for pid in $(pgrep -f 'bin/Runner\.(Listener|Worker)' || true); do
             sudo sh -c "echo -1000 > /proc/$pid/oom_score_adj" 2>/dev/null || true
           done
-          sudo sysctl -w vm.swappiness=10 || true
+          sudo sysctl -w vm.swappiness=1 || true
 
           # Disk and memory every 10 minutes, so a future failure shows what ran out
           ( while true; do
