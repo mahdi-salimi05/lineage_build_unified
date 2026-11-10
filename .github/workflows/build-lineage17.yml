@@ -68,14 +68,9 @@ jobs:
       GSI_CCACHE_MB: '4096'
 
     steps:
-      # actions/cache downloads its archive (~2.7 GB for this ccache) into RUNNER_TEMP, which is on
-      # the small ROOT disk, and that disk had only ~1.7 GB free here -> "ENOSPC" at 80%, no cache
-      # restored, cold build. Free the runner image's preinstalled toolcache BEFORE the restore.
-      # (Raising root-reserve-mb instead would shrink the build volume 1:1, and that one is tight.)
       - name: Free root disk space for the cache download
         run: |
           df -h / | cat
-          # Only delete it if nothing this job uses lives in there
           for t in git python3 tar zstd curl xz; do
             p=$(command -v "$t" || true)
             case "$p" in
@@ -88,9 +83,7 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
-          # Root keeps the OS, apt packages and the temp dir where actions/cache writes
-          # its archive before upload, so it needs more than a few GB of headroom.
-          root-reserve-mb: 6144
+          root-reserve-mb: 4608
           temp-reserve-mb: 512
           swap-size-mb: 8192
           remove-dotnet: 'true'
@@ -98,6 +91,24 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
           remove-docker-images: 'true'
+
+      # FIX: Bind-mount RUNNER_TEMP to the 95 GB build volume so cache downloads have 90+ GB of room
+      - name: Redirect RUNNER_TEMP to the large build volume
+        run: |
+          echo "Current RUNNER_TEMP: $RUNNER_TEMP"
+          df -h "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+          
+          # Create temporary folder on the large volume
+          mkdir -p "$GITHUB_WORKSPACE/.runner_temp"
+          
+          # Copy any existing runner files (like _runner_file_commands) so nothing breaks
+          cp -a "$RUNNER_TEMP/." "$GITHUB_WORKSPACE/.runner_temp/"
+          
+          # Bind-mount so any process writing to RUNNER_TEMP physically writes to the 95GB volume
+          sudo mount --bind "$GITHUB_WORKSPACE/.runner_temp" "$RUNNER_TEMP"
+          
+          echo "RUNNER_TEMP is now backed by:"
+          df -h "$RUNNER_TEMP"
 
       - name: Enable zswap (if the kernel supports it)
         run: |
@@ -119,9 +130,6 @@ jobs:
 
       - name: Disable systemd-oomd (userspace OOM killer)
         run: |
-          # systemd-oomd kills whole cgroups on sustained memory *pressure* (PSI), which a
-          # swap-heavy link step can trigger long before the kernel is actually out of memory.
-          # Mask both units: the .socket would otherwise re-activate the .service.
           echo "Before:"; systemctl list-unit-files 'systemd-oomd*' --no-legend 2>/dev/null || true
           sudo systemctl disable --now systemd-oomd.service systemd-oomd.socket 2>/dev/null || true
           sudo systemctl mask systemd-oomd.service systemd-oomd.socket 2>/dev/null || true
@@ -146,13 +154,9 @@ jobs:
             libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool \
             squashfs-tools xsltproc zip zlib1g-dev python3 python2 xz-utils
 
-          # Android 10 expects `python` to be Python 2 (do NOT use python-is-python3)
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           python --version
 
-          # `repo init --git-lfs` (below) needs git-lfs plus its filter in the global git config.
-          # LineageOS 17.1 now stores the WebView prebuilts in Git LFS; without this you get
-          # 133-byte text pointers instead of the real .apk files.
           git lfs install --skip-repo
           git lfs version
           sudo apt-get clean
@@ -168,6 +172,7 @@ jobs:
           git config --global user.email "actions@github.com"
           git config --global color.ui false
           git config --global core.compression 0
+          git config --global --add safe.directory "*"
 
       - name: Restore ccache
         uses: actions/cache/restore@v4
