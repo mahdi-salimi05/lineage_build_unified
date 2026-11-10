@@ -73,7 +73,7 @@ jobs:
         with:
           # Root keeps the OS, apt packages and the temp dir where actions/cache writes
           # its archive before upload, so it needs more than a few GB of headroom.
-          root-reserve-mb: 10240
+          root-reserve-mb: 6144
           temp-reserve-mb: 512
           swap-size-mb: 8192
           remove-dotnet: 'true'
