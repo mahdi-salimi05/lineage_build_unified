@@ -257,6 +257,22 @@ jobs:
           else
             echo "WARNING: vendor/vndk-tests/run.sh is not in the expected shape; left unpatched"
           fi
+
+          # Sounds. LineageOS's build/make picks the sound set with `ifeq ($(LINEAGE_BUILD),)`. A phh
+          # GSI is built with plain `lunch`, so LINEAGE_BUILD is empty and the AOSP classic set
+          # (AllAudio.mk) is used - whose "Platinum" is the very same recording as LineageOS's
+          # "Platinum Old" (vendor/lineage aosp_audio.mk). Use the material set a normal LineageOS
+          # build uses (its "Platinum" is a different sound). Only the audio include is switched:
+          # the same condition also guards ringtone defaults and the APN file, so do not just set
+          # LINEAGE_BUILD.
+          for f in build/make/target/product/gsi_common.mk build/make/target/product/full_base.mk; do
+            if grep -q 'sounds/AllAudio\.mk' "$f" 2>/dev/null; then
+              sed -i 's#^\(\$(call inherit-product-if-exists, frameworks/base/data/sounds/\)AllAudio\.mk)$#\1AudioPackage14.mk)#' "$f"
+              grep -q 'sounds/AllAudio\.mk' "$f" && echo "WARNING: $f still references AllAudio.mk" || echo "sounds: $f now inherits AudioPackage14.mk"
+            else
+              echo "WARNING: $f has no AllAudio.mk include (already changed upstream?)"
+            fi
+          done
           EOF
 
           if [ "${{ inputs.free_repo_dir }}" = "true" ]; then
