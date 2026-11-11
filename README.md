@@ -13,7 +13,7 @@ Create a new working directory for your LineageOS build and navigate to it:
 
 Initialize your LineageOS workspace:
 
-    repo init -u https://github.com/LineageOS/android.git -b lineage-17.1
+    repo init -u https://github.com/LineageOS/android.git -b lineage-17.1 --git-lfs
 
 Clone the modified treble patches and this repo:
 
