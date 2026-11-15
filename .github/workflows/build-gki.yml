@@ -1,0 +1,285 @@
+name: Build Android GKI Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_xml_url:
+        description: 'Direct URL to manifest.xml (raw GitHub URL, ci.android.com manifest, or android.googlesource.com ?format=TEXT)'
+        required: true
+        type: string
+      manifest_repo_url:
+        description: 'Base manifest git repository URL for repo init'
+        required: false
+        default: 'https://android.googlesource.com/kernel/manifest'
+        type: string
+      build_mode:
+        description: 'Build system (auto detects tools/bazel vs build/build.sh)'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - kleaf
+          - legacy
+      bazel_target:
+        description: 'Kleaf Bazel dist target (used for Android 13+ Kleaf builds)'
+        required: false
+        default: '//common:kernel_aarch64_dist'
+        type: string
+      build_config:
+        description: 'Build config path (used for legacy build/build.sh builds)'
+        required: false
+        default: 'common/build.config.gki.aarch64'
+        type: string
+      lto:
+        description: 'LTO mode (default uses manifest setting; thin uses much less RAM than full)'
+        required: true
+        default: 'default'
+        type: choice
+        options:
+          - default
+          - thin
+          - full
+          - none
+      shallow_sync:
+        description: 'Use --depth=1 for repo sync (keep FALSE for pinned SHA release manifests!)'
+        required: false
+        default: false
+        type: boolean
+      create_release:
+        description: 'Publish compiled GKI images to GitHub Releases'
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: 'Release tag prefix (run ID will be appended)'
+        required: false
+        default: 'gki-kernel'
+        type: string
+
+jobs:
+  build-gki:
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-22.04' }}
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    env:
+      LC_ALL: C
+      MANIFEST_XML_URL: ${{ inputs.manifest_xml_url }}
+      MANIFEST_REPO_URL: ${{ inputs.manifest_repo_url }}
+
+    steps:
+      - name: Free host disk space
+        if: ${{ !vars.RUNNER_LABEL || startsWith(vars.RUNNER_LABEL, 'ubuntu-') }}
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          echo "Disk space after cleanup:"
+          df -h /
+
+      - name: Setup swap space & OOM protection
+        run: |
+          # Protect runner daemon from OOM-killer during heavy LTO linking
+          for pid in $(pgrep -f 'bin/Runner\.(Listener|Worker)' || true); do
+            sudo sh -c "echo -1000 > /proc/$pid/oom_score_adj" 2>/dev/null || true
+          done
+
+          # Create a 6 GB swapfile if total swap is under 4 GB
+          CURRENT_SWAP_MB=$(free -m | awk '/^Swap:/ {print $2}')
+          if [ "${CURRENT_SWAP_MB:-0}" -lt 4096 ]; then
+            sudo swapoff -a || true
+            sudo fallocate -l 6G /swapfile
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+          fi
+          free -h
+
+      - name: Install build dependencies & repo tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential cpio curl flex git git-lfs gnupg \
+            libelf-dev libncurses5 libssl-dev lz4 python3 python-is-python3 \
+            rsync tar unzip xz-utils zip zlib1g-dev zstd
+          sudo apt-get clean
+
+          git lfs install --skip-repo
+
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configure git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+          git config --global --add safe.directory "*"
+
+      - name: Download manifest.xml & sync GKI sources
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/gki"
+          cd "$GITHUB_WORKSPACE/gki"
+
+          # 1. Initialize base manifest repo
+          DEPTH_ARG=""
+          if [ "${{ inputs.shallow_sync }}" = "true" ]; then
+            DEPTH_ARG="--depth=1"
+          fi
+          repo init -u "$MANIFEST_REPO_URL" --no-clone-bundle $DEPTH_ARG < /dev/null
+
+          # 2. Download selected manifest.xml URL (supports both raw XML and Gitiles base64 ?format=TEXT)
+          echo "Downloading manifest from: $MANIFEST_XML_URL"
+          curl -fsSL "$MANIFEST_XML_URL" -o /tmp/raw_manifest
+
+          if grep -q '<manifest' /tmp/raw_manifest; then
+            cp /tmp/raw_manifest .repo/manifests/custom_manifest.xml
+          elif base64 -d /tmp/raw_manifest > /tmp/decoded_manifest 2>/dev/null && grep -q '<manifest' /tmp/decoded_manifest; then
+            echo "Decoded base64 manifest."
+            cp /tmp/decoded_manifest .repo/manifests/custom_manifest.xml
+          else
+            echo "::error::Downloaded file is not a valid repo manifest XML!"
+            head -n 20 /tmp/raw_manifest
+            exit 1
+          fi
+
+          # 3. Point repo to the downloaded manifest and sync
+          repo init -m custom_manifest.xml < /dev/null
+          echo "Syncing repositories..."
+          repo sync -c --no-tags --no-clone-bundle --force-sync -j"$(nproc)" \
+            || repo sync -c --no-tags --no-clone-bundle --force-sync -j4
+
+          df -h / "$GITHUB_WORKSPACE"
+
+      - name: Build GKI kernel
+        id: build
+        run: |
+          cd "$GITHUB_WORKSPACE/gki"
+          DIST_DIR="$GITHUB_WORKSPACE/gki_dist"
+          mkdir -p "$DIST_DIR"
+
+          MODE="${{ inputs.build_mode }}"
+          if [ "$MODE" = "auto" ]; then
+            if [ -x tools/bazel ] && [ -f common/BUILD.bazel ]; then
+              MODE="kleaf"
+            elif [ -f build/build.sh ] || [ -f build/kernel/build.sh ]; then
+              MODE="legacy"
+            else
+              echo "::error::Could not detect build system (neither tools/bazel nor build.sh found)"
+              exit 1
+            fi
+          fi
+          echo "Detected/Selected build mode: $MODE"
+
+          if [ "$MODE" = "kleaf" ]; then
+            TARGET="${{ inputs.bazel_target }}"
+            LTO_FLAG=""
+            if [ "${{ inputs.lto }}" != "default" ]; then
+              LTO_FLAG="--lto=${{ inputs.lto }}"
+            fi
+
+            # Android 14+ Kleaf uses --destdir; older Android 13 Kleaf uses --dist_dir
+            if grep -rq -- '--destdir' build/kernel/kleaf/ 2>/dev/null; then
+              DIST_FLAG="--destdir=$DIST_DIR"
+            else
+              DIST_FLAG="--dist_dir=$DIST_DIR"
+            fi
+
+            echo "Running: tools/bazel run $LTO_FLAG $TARGET -- $DIST_FLAG"
+            tools/bazel run $LTO_FLAG "$TARGET" -- "$DIST_FLAG"
+
+          else
+            if [ -f build/kernel/build.sh ]; then
+              BUILD_SH="build/kernel/build.sh"
+            else
+              BUILD_SH="build/build.sh"
+            fi
+
+            export BUILD_CONFIG="${{ inputs.build_config }}"
+            export OUT_DIR="$PWD/out"
+            export DIST_DIR="$DIST_DIR"
+            if [ "${{ inputs.lto }}" != "default" ]; then
+              export LTO="${{ inputs.lto }}"
+            fi
+
+            echo "Running: BUILD_CONFIG=$BUILD_CONFIG $BUILD_SH"
+            bash "$BUILD_SH"
+          fi
+
+          echo "Build completed. Dist contents:"
+          ls -lh "$DIST_DIR"
+
+      - name: Package GKI outputs & generate checksums
+        run: |
+          DIST_DIR="$GITHUB_WORKSPACE/gki_dist"
+          PKG_DIR="$GITHUB_WORKSPACE/gki_release"
+          mkdir -p "$PKG_DIR"
+
+          # Save a copy of the exact manifest used for reproducibility
+          cp "$GITHUB_WORKSPACE/gki/.repo/manifests/custom_manifest.xml" "$PKG_DIR/manifest.xml"
+
+          # Copy kernel images, boot images, System.map, and config artifacts
+          shopt -s nullglob
+          for f in \
+            "$DIST_DIR"/Image* \
+            "$DIST_DIR"/boot*.img \
+            "$DIST_DIR"/System.map \
+            "$DIST_DIR"/*.img \
+            "$DIST_DIR"/gki* \
+            "$DIST_DIR"/abi* ; do
+            if [ -f "$f" ]; then
+              cp -v "$f" "$PKG_DIR/"
+            fi
+          done
+
+          # Archive kernel modules (.ko) if present
+          ko_files=("$DIST_DIR"/*.ko)
+          if [ ${#ko_files[@]} -gt 0 ]; then
+            echo "Archiving ${#ko_files[@]} kernel modules..."
+            tar -C "$DIST_DIR" -cf - *.ko modules.* 2>/dev/null | zstd -T0 -12 -o "$PKG_DIR/gki-modules.tar.zst" || \
+            tar -C "$DIST_DIR" -cf - *.ko | zstd -T0 -12 -o "$PKG_DIR/gki-modules.tar.zst"
+          fi
+
+          # Compress vmlinux separately if present (uncompressed vmlinux is often 400+ MB)
+          if [ -f "$DIST_DIR/vmlinux" ]; then
+            echo "Compressing vmlinux..."
+            zstd -T0 -12 "$DIST_DIR/vmlinux" -o "$PKG_DIR/vmlinux.zst"
+          fi
+
+          cd "$PKG_DIR"
+          ls -lh
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload GKI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-${{ inputs.release_tag }}-${{ github.run_id }}
+          path: gki_release/*
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}-${{ github.run_id }}
+          name: "Android GKI Kernel (${{ inputs.release_tag }})"
+          body: |
+            ### Android GKI Kernel Build
+            - **Manifest URL:** `${{ inputs.manifest_xml_url }}`
+            - **LTO:** `${{ inputs.lto }}`
+            - **Build Mode:** `${{ inputs.build_mode }}`
+          files: gki_release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
