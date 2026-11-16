@@ -25,7 +25,7 @@ on:
         default: 'https://android.googlesource.com/kernel/manifest'
         type: string
       manifest_repo_branch:
-        description: 'Branch of the manifest repo for "repo init". Leave empty for its default branch (HEAD). Only used to bootstrap repo; the manifest.xml above decides what is built'
+        description: 'Branch of the manifest repo for "repo init". Leave empty to let repo use the default branch of the manifest repo. Only used to bootstrap repo; the manifest.xml above decides what is built'
         required: false
         default: ''
         type: string
@@ -69,14 +69,14 @@ on:
         default: false
         type: boolean
       upload_artifact:
-        description: 'Keep the images as a workflow artifact for 14 days (free accounts have only 500 MB of artifact storage in total; turn this off if you publish a release)'
-        required: false
-        default: true
-        type: boolean
-      create_release:
-        description: 'Publish the images to GitHub Releases (no storage quota; at least one of upload_artifact / create_release must be on)'
+        description: 'Keep the images as a workflow artifact for 14 days. Free accounts have only 500 MB of artifact storage in total, and a full GKI output can come close to that'
         required: false
         default: false
+        type: boolean
+      create_release:
+        description: 'Publish the images to GitHub Releases (no storage quota). At least one of upload_artifact / create_release must be on'
+        required: false
+        default: true
         type: boolean
       release_tag:
         description: 'Release tag prefix (the run id is appended, so re-runs never collide)'
@@ -113,12 +113,18 @@ jobs:
 
     steps:
       # 1. Free the toolcache etc. BEFORE maximize-build-space sizes the volume (same as build-lineage17.yml)
-      - name: Pre-clean runner host to maximize LVM volume
+      - name: Check that the result will be kept
         run: |
           if [ "$UPLOAD_ARTIFACT" != true ] && [ "$CREATE_RELEASE" != true ]; then
             echo "::error::Both upload_artifact and create_release are off - the build result would be thrown away. Turn one on."
             exit 1
           fi
+
+      # The next five steps change the host (rm -rf, LVM, swap, ~/.cache): hosted Ubuntu runners only,
+      # so setting vars.RUNNER_LABEL to a self-hosted machine does not touch that machine.
+      - name: Pre-clean runner host to maximize LVM volume
+        if: ${{ !vars.RUNNER_LABEL || startsWith(vars.RUNNER_LABEL, 'ubuntu-') }}
+        run: |
           df -h / | cat
           sudo rm -rf /opt/hostedtoolcache /usr/local/share/boost /usr/local/lib/node_modules /opt/pipx
           sudo apt-get clean
@@ -126,6 +132,7 @@ jobs:
 
       # 2. One big build volume plus disk swap (a full-LTO link can need more RAM than the runner has)
       - name: Maximize build space
+        if: ${{ !vars.RUNNER_LABEL || startsWith(vars.RUNNER_LABEL, 'ubuntu-') }}
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 4308
@@ -138,6 +145,7 @@ jobs:
           remove-docker-images: 'true'
 
       - name: Enable zswap (if the kernel supports it)
+        if: ${{ !vars.RUNNER_LABEL || startsWith(vars.RUNNER_LABEL, 'ubuntu-') }}
         run: |
           P=/sys/module/zswap/parameters
           if [ ! -d "$P" ]; then
@@ -156,6 +164,7 @@ jobs:
           swapon --show
 
       - name: Disable systemd-oomd (userspace OOM killer)
+        if: ${{ !vars.RUNNER_LABEL || startsWith(vars.RUNNER_LABEL, 'ubuntu-') }}
         run: |
           sudo systemctl disable --now systemd-oomd.service systemd-oomd.socket 2>/dev/null || true
           sudo systemctl mask systemd-oomd.service systemd-oomd.socket 2>/dev/null || true
@@ -164,6 +173,7 @@ jobs:
           done
 
       - name: Put ~/.cache (Bazel output tree) on the big build volume
+        if: ${{ !vars.RUNNER_LABEL || startsWith(vars.RUNNER_LABEL, 'ubuntu-') }}
         run: |
           # The root filesystem only has ~4 GB left; Bazel would otherwise fill it.
           mkdir -p "$GITHUB_WORKSPACE/.home_cache"
@@ -268,9 +278,10 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/gki"
           cd "$GITHUB_WORKSPACE/gki"
 
-          DEPTH=()
-          [ "$SHALLOW_SYNC" = "true" ] && DEPTH=(--depth=1)
-          repo init -u "$MANIFEST_REPO_URL" -b "${MANIFEST_REPO_BRANCH:-HEAD}" --no-clone-bundle "${DEPTH[@]}" < /dev/null
+          INIT=(-u "$MANIFEST_REPO_URL" --no-clone-bundle)
+          [ -n "$MANIFEST_REPO_BRANCH" ] && INIT+=(-b "$MANIFEST_REPO_BRANCH")
+          [ "$SHALLOW_SYNC" = "true" ] && INIT+=(--depth=1)
+          repo init "${INIT[@]}" < /dev/null
 
           # Use the downloaded file instead of the repo's default.xml
           cp "$GITHUB_WORKSPACE/custom_manifest.xml" .repo/manifests/custom_manifest.xml
@@ -366,6 +377,7 @@ jobs:
           ls -lh "$DIST_DIR"
 
       - name: Package outputs
+        id: package
         run: |
           DIST="$GITHUB_WORKSPACE/gki_dist"
           OUT="$GITHUB_WORKSPACE/gki_release"
@@ -430,15 +442,6 @@ jobs:
           ls -lh "$OUT"; echo; cat "$OUT/SHA256SUMS.txt"
           { echo "### GKI $KVER built ($MODE)"; echo; ls -lh "$OUT" | awk 'NR>1 {print "- " $9 " (" $5 ")"}'; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload artifacts
-        if: ${{ inputs.upload_artifact }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: gki-${{ github.run_id }}
-          path: gki_release/*
-          retention-days: 14
-          if-no-files-found: error
-
       - name: Upload build log (failed or cancelled run)
         if: ${{ failure() || cancelled() }}
         uses: actions/upload-artifact@v4
@@ -489,3 +492,12 @@ jobs:
 
           gh release edit "$TAG" --draft=false
           echo "### Published release \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: ${{ !cancelled() && inputs.upload_artifact && steps.package.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-${{ github.run_id }}
+          path: gki_release/*
+          retention-days: 14
+          if-no-files-found: error
