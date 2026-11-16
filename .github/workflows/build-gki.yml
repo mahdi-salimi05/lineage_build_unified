@@ -1,19 +1,36 @@
-name: Build Android GKI Image
+name: Build Android GKI kernel
+
+# Builds an Android Generic Kernel Image (GKI) from any repo manifest.xml you point it at.
+#
+#   * Manifest URL: a raw URL (GitHub raw / blob, ci.android.com ...) or an android.googlesource.com
+#     Gitiles link (base64 "?format=TEXT" is detected and decoded; a plain /+/ link gets ?format=TEXT
+#     added). The file is validated as a repo manifest before anything is synced.
+#   * Build system is auto-detected: Kleaf (tools/bazel, Android 13 and newer) or the legacy
+#     build/build.sh (Android 11 - 13).
+#   * Same runner tuning as build-lineage17.yml: toolcache pre-clean, one big LVM build volume,
+#     disk swap + zswap, systemd-oomd off, runner protected from the OOM killer.
+#
+# Save as: .github/workflows/build-gki.yml   (no other files are needed in the repo)
 
 on:
   workflow_dispatch:
     inputs:
       manifest_xml_url:
-        description: 'Direct URL to manifest.xml (raw GitHub URL, ci.android.com manifest, or android.googlesource.com ?format=TEXT)'
+        description: 'URL of the manifest.xml to build (raw URL, github.com/.../blob/..., ci.android.com, or android.googlesource.com/.../+/...)'
         required: true
         type: string
       manifest_repo_url:
-        description: 'Base manifest git repository URL for repo init'
-        required: false
+        description: 'Manifest git repo for "repo init". Relative <remote fetch=".."> entries in the manifest resolve against this URL'
+        required: true
         default: 'https://android.googlesource.com/kernel/manifest'
         type: string
+      manifest_repo_branch:
+        description: 'Branch of the manifest repo for "repo init". Leave empty for its default branch (HEAD). Only used to bootstrap repo; the manifest.xml above decides what is built'
+        required: false
+        default: ''
+        type: string
       build_mode:
-        description: 'Build system (auto detects tools/bazel vs build/build.sh)'
+        description: 'auto = Kleaf if tools/bazel exists, else build/build.sh'
         required: true
         default: 'auto'
         type: choice
@@ -22,17 +39,17 @@ on:
           - kleaf
           - legacy
       bazel_target:
-        description: 'Kleaf Bazel dist target (used for Android 13+ Kleaf builds)'
+        description: 'Kleaf only: dist target to run'
         required: false
         default: '//common:kernel_aarch64_dist'
         type: string
       build_config:
-        description: 'Build config path (used for legacy build/build.sh builds)'
+        description: 'Legacy only: BUILD_CONFIG for build/build.sh'
         required: false
         default: 'common/build.config.gki.aarch64'
         type: string
       lto:
-        description: 'LTO mode (default uses manifest setting; thin uses much less RAM than full)'
+        description: 'LTO mode. default = whatever the manifest/tree uses. thin needs far less RAM than full'
         required: true
         default: 'default'
         type: choice
@@ -41,245 +58,434 @@ on:
           - thin
           - full
           - none
+      extra_args:
+        description: 'Kleaf only: extra bazel options placed before the target, e.g. --config=fast (space separated, no quotes)'
+        required: false
+        default: ''
+        type: string
       shallow_sync:
-        description: 'Use --depth=1 for repo sync (keep FALSE for pinned SHA release manifests!)'
+        description: 'repo init --depth=1. Keep OFF for manifests that pin commit SHAs (the server often refuses shallow fetches of non-tip SHAs)'
         required: false
         default: false
         type: boolean
+      upload_artifact:
+        description: 'Keep the images as a workflow artifact for 14 days (free accounts have only 500 MB of artifact storage in total; turn this off if you publish a release)'
+        required: false
+        default: true
+        type: boolean
       create_release:
-        description: 'Publish compiled GKI images to GitHub Releases'
+        description: 'Publish the images to GitHub Releases (no storage quota; at least one of upload_artifact / create_release must be on)'
         required: false
         default: false
         type: boolean
       release_tag:
-        description: 'Release tag prefix (run ID will be appended)'
+        description: 'Release tag prefix (the run id is appended, so re-runs never collide)'
         required: false
         default: 'gki-kernel'
         type: string
 
+defaults:
+  run:
+    shell: bash # = bash -eo pipefail, so a failing build is not hidden behind "| tee"
+
 jobs:
   build-gki:
     runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-22.04' }}
-    timeout-minutes: 360
+    timeout-minutes: 360 # maximum for GitHub-hosted runners
     permissions:
-      contents: write
+      contents: write # only used by the release step
 
     env:
       LC_ALL: C
+      # Inputs go through env vars, never straight into shell text (URLs contain ? & ; characters).
       MANIFEST_XML_URL: ${{ inputs.manifest_xml_url }}
       MANIFEST_REPO_URL: ${{ inputs.manifest_repo_url }}
+      MANIFEST_REPO_BRANCH: ${{ inputs.manifest_repo_branch }}
+      UPLOAD_ARTIFACT: ${{ inputs.upload_artifact }}
+      CREATE_RELEASE: ${{ inputs.create_release }}
+      BUILD_MODE: ${{ inputs.build_mode }}
+      BAZEL_TARGET: ${{ inputs.bazel_target }}
+      BUILD_CONFIG_IN: ${{ inputs.build_config }}
+      LTO_MODE: ${{ inputs.lto }}
+      EXTRA_ARGS: ${{ inputs.extra_args }}
+      SHALLOW_SYNC: ${{ inputs.shallow_sync }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
 
     steps:
-      - name: Free host disk space
-        if: ${{ !vars.RUNNER_LABEL || startsWith(vars.RUNNER_LABEL, 'ubuntu-') }}
+      # 1. Free the toolcache etc. BEFORE maximize-build-space sizes the volume (same as build-lineage17.yml)
+      - name: Pre-clean runner host to maximize LVM volume
         run: |
-          echo "Disk space before cleanup:"
-          df -h /
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /usr/local/lib/node_modules
-          sudo docker image prune --all --force || true
+          if [ "$UPLOAD_ARTIFACT" != true ] && [ "$CREATE_RELEASE" != true ]; then
+            echo "::error::Both upload_artifact and create_release are off - the build result would be thrown away. Turn one on."
+            exit 1
+          fi
+          df -h / | cat
+          sudo rm -rf /opt/hostedtoolcache /usr/local/share/boost /usr/local/lib/node_modules /opt/pipx
           sudo apt-get clean
-          echo "Disk space after cleanup:"
-          df -h /
+          df -h / | cat
 
-      - name: Setup swap space & OOM protection
+      # 2. One big build volume plus disk swap (a full-LTO link can need more RAM than the runner has)
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 4308
+          temp-reserve-mb: 512
+          swap-size-mb: 6144
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Enable zswap (if the kernel supports it)
         run: |
-          # Protect runner daemon from OOM-killer during heavy LTO linking
-          for pid in $(pgrep -f 'bin/Runner\.(Listener|Worker)' || true); do
-            sudo sh -c "echo -1000 > /proc/$pid/oom_score_adj" 2>/dev/null || true
+          P=/sys/module/zswap/parameters
+          if [ ! -d "$P" ]; then
+            echo "::warning::zswap not available in kernel $(uname -r); skipping"
+            exit 0
+          fi
+          set_param() { echo "$2" | sudo tee "$P/$1" >/dev/null 2>&1 || echo "::warning::could not set zswap $1=$2"; }
+          sudo modprobe zstd 2>/dev/null || true
+          set_param compressor zstd
+          if [ -e "$P/zpool" ]; then sudo modprobe zsmalloc 2>/dev/null || true; set_param zpool zsmalloc; fi
+          set_param max_pool_percent 25
+          set_param enabled 1
+          for f in enabled compressor zpool max_pool_percent; do
+            [ -e "$P/$f" ] && echo "zswap $f = $(cat $P/$f)"
+          done
+          swapon --show
+
+      - name: Disable systemd-oomd (userspace OOM killer)
+        run: |
+          sudo systemctl disable --now systemd-oomd.service systemd-oomd.socket 2>/dev/null || true
+          sudo systemctl mask systemd-oomd.service systemd-oomd.socket 2>/dev/null || true
+          for u in systemd-oomd.service systemd-oomd.socket; do
+            echo "$u: enabled=$(systemctl is-enabled "$u" 2>&1 | head -1) active=$(systemctl is-active "$u" 2>&1 | head -1)"
           done
 
-          # Create a 6 GB swapfile if total swap is under 4 GB
-          CURRENT_SWAP_MB=$(free -m | awk '/^Swap:/ {print $2}')
-          if [ "${CURRENT_SWAP_MB:-0}" -lt 4096 ]; then
-            sudo swapoff -a || true
-            sudo fallocate -l 6G /swapfile
-            sudo chmod 600 /swapfile
-            sudo mkswap /swapfile
-            sudo swapon /swapfile
+      - name: Put ~/.cache (Bazel output tree) on the big build volume
+        run: |
+          # The root filesystem only has ~4 GB left; Bazel would otherwise fill it.
+          mkdir -p "$GITHUB_WORKSPACE/.home_cache"
+          if [ -d "$HOME/.cache" ] && [ ! -L "$HOME/.cache" ]; then
+            cp -a "$HOME/.cache/." "$GITHUB_WORKSPACE/.home_cache/" 2>/dev/null || true
+            rm -rf "$HOME/.cache"
           fi
-          free -h
+          ln -sfn "$GITHUB_WORKSPACE/.home_cache" "$HOME/.cache"
+          ls -ld "$HOME/.cache"
+          df -h "$GITHUB_WORKSPACE" / | cat
 
-      - name: Install build dependencies & repo tool
+      - name: Install build dependencies and repo
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential cpio curl flex git git-lfs gnupg \
-            libelf-dev libncurses5 libssl-dev lz4 python3 python-is-python3 \
-            rsync tar unzip xz-utils zip zlib1g-dev zstd
+            bc bison build-essential cpio curl flex git gnupg libelf-dev libncurses5 \
+            libssl-dev lz4 python3 python-is-python3 rsync tar unzip xz-utils zip \
+            zlib1g-dev zstd
           sudo apt-get clean
 
-          git lfs install --skip-repo
-
           mkdir -p "$HOME/bin"
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          curl -fsSL --retry 3 https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
           chmod a+x "$HOME/bin/repo"
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Configure git
-        run: |
-          git config --global user.name "GitHub Actions"
+          git config --global user.name  "GitHub Actions"
           git config --global user.email "actions@github.com"
           git config --global color.ui false
           git config --global --add safe.directory "*"
 
-      - name: Download manifest.xml & sync GKI sources
+      # Fail fast on a bad URL, before spending 20+ minutes on repo sync
+      - name: Download and validate manifest.xml
+        run: |
+          url="$MANIFEST_XML_URL"
+
+          # github.com/<user>/<repo>/blob/<ref>/<path>  ->  raw.githubusercontent.com
+          if [[ "$url" =~ ^https://github\.com/([^/]+)/([^/]+)/blob/(.+)$ ]]; then
+            url="https://raw.githubusercontent.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+            echo "GitHub blob link rewritten to the raw URL"
+          fi
+          # Gitiles /+/ pages are HTML; ?format=TEXT returns the file base64-encoded
+          if [[ "$url" == *googlesource.com/*/+/* && "$url" != *format=* ]]; then
+            if [[ "$url" == *\?* ]]; then url="$url&format=TEXT"; else url="$url?format=TEXT"; fi
+            echo "Gitiles link: asking for ?format=TEXT"
+          fi
+
+          echo "Downloading: $url"
+          curl -fsSL --retry 3 --retry-delay 5 "$url" -o "$RUNNER_TEMP/manifest.download"
+
+          python3 -I - "$RUNNER_TEMP/manifest.download" "$GITHUB_WORKSPACE/custom_manifest.xml" <<'PY'
+          import base64, binascii, os, sys
+          import xml.etree.ElementTree as ET
+
+          src, dst = sys.argv[1], sys.argv[2]
+          raw = open(src, "rb").read()
+
+
+          def parse(blob):
+              try:
+                  root = ET.fromstring(blob)
+              except ET.ParseError:
+                  return None
+              return root if root.tag == "manifest" else None
+
+
+          root, data, how = parse(raw), raw, "plain XML"
+          if root is None:
+              try:
+                  data = base64.b64decode(b"".join(raw.split()), validate=True)
+              except (binascii.Error, ValueError):
+                  data = b""
+              root, how = (parse(data) if data else None), "base64 (Gitiles ?format=TEXT)"
+          if root is None:
+              print("::error::The download is not a repo manifest (neither XML nor base64-encoded XML). First bytes:")
+              print(raw[:300].decode("utf-8", "replace"))
+              sys.exit(1)
+
+          projects = root.findall("project")
+          includes = [i.get("name") for i in root.findall("include")]
+          remotes = {r.get("name"): r.get("fetch") for r in root.findall("remote")}
+          paths = {p.get("path") or p.get("name") for p in projects}
+          if not projects and not includes:
+              print("::error::The manifest has no <project> and no <include> entries")
+              sys.exit(1)
+
+          open(dst, "wb").write(data)
+          print("Manifest format :", how)
+          print("Projects        :", len(projects))
+          print("Remotes         :", remotes)
+          d = root.find("default")
+          print("Default revision:", d.get("revision") if d is not None else None)
+          print("Has common/     :", "common" in paths, "| has build tooling:", "build/kernel" in paths or "build" in paths)
+          if includes:
+              print("::warning::The manifest uses <include name=...> (%s). These must exist in the manifest repo; they are not downloaded." % ", ".join(includes))
+          rel = [n for n, f in remotes.items() if f and not f.startswith(("http://", "https://", "ssh://", "git://", "file://"))]
+          if rel:
+              print("::notice::Remotes %s use relative fetch URLs; they resolve against manifest_repo_url (%s)" % (rel, os.environ.get("MANIFEST_REPO_URL")))
+          PY
+
+      - name: Sync sources
         run: |
           mkdir -p "$GITHUB_WORKSPACE/gki"
           cd "$GITHUB_WORKSPACE/gki"
 
-          # 1. Initialize base manifest repo
-          DEPTH_ARG=""
-          if [ "${{ inputs.shallow_sync }}" = "true" ]; then
-            DEPTH_ARG="--depth=1"
-          fi
-          repo init -u "$MANIFEST_REPO_URL" --no-clone-bundle $DEPTH_ARG < /dev/null
+          DEPTH=()
+          [ "$SHALLOW_SYNC" = "true" ] && DEPTH=(--depth=1)
+          repo init -u "$MANIFEST_REPO_URL" -b "${MANIFEST_REPO_BRANCH:-HEAD}" --no-clone-bundle "${DEPTH[@]}" < /dev/null
 
-          # 2. Download selected manifest.xml URL (supports both raw XML and Gitiles base64 ?format=TEXT)
-          echo "Downloading manifest from: $MANIFEST_XML_URL"
-          curl -fsSL "$MANIFEST_XML_URL" -o /tmp/raw_manifest
-
-          if grep -q '<manifest' /tmp/raw_manifest; then
-            cp /tmp/raw_manifest .repo/manifests/custom_manifest.xml
-          elif base64 -d /tmp/raw_manifest > /tmp/decoded_manifest 2>/dev/null && grep -q '<manifest' /tmp/decoded_manifest; then
-            echo "Decoded base64 manifest."
-            cp /tmp/decoded_manifest .repo/manifests/custom_manifest.xml
-          else
-            echo "::error::Downloaded file is not a valid repo manifest XML!"
-            head -n 20 /tmp/raw_manifest
-            exit 1
-          fi
-
-          # 3. Point repo to the downloaded manifest and sync
+          # Use the downloaded file instead of the repo's default.xml
+          cp "$GITHUB_WORKSPACE/custom_manifest.xml" .repo/manifests/custom_manifest.xml
           repo init -m custom_manifest.xml < /dev/null
-          echo "Syncing repositories..."
-          repo sync -c --no-tags --no-clone-bundle --force-sync -j"$(nproc)" \
-            || repo sync -c --no-tags --no-clone-bundle --force-sync -j4
 
-          df -h / "$GITHUB_WORKSPACE"
+          for J in "$(nproc)" 4 2; do
+            echo "repo sync -j$J"
+            if repo sync -c --no-tags --no-clone-bundle --force-sync --optimized-fetch -j"$J" < /dev/null; then
+              ok=1; break
+            fi
+            echo "::warning::repo sync failed with -j$J, retrying"; sleep 30
+          done
+          [ "${ok:-0}" = 1 ] || { echo "::error::repo sync failed"; exit 1; }
 
-      - name: Build GKI kernel
-        id: build
+          # Exact revisions that were built (a branch-tip manifest moves; this file does not)
+          repo manifest -r -o "$GITHUB_WORKSPACE/resolved-manifest.xml" || echo "::warning::could not write the resolved manifest"
+          df -h / "$GITHUB_WORKSPACE" | cat
+
+      - name: Build GKI
+        timeout-minutes: 300
         run: |
           cd "$GITHUB_WORKSPACE/gki"
           DIST_DIR="$GITHUB_WORKSPACE/gki_dist"
-          mkdir -p "$DIST_DIR"
+          LOG="$GITHUB_WORKSPACE/build.log"
+          mkdir -p "$DIST_DIR"; : > "$LOG"
 
-          MODE="${{ inputs.build_mode }}"
-          if [ "$MODE" = "auto" ]; then
+          for pid in $(pgrep -f 'bin/Runner\.(Listener|Worker)' || true); do
+            sudo sh -c "echo -1000 > /proc/$pid/oom_score_adj" 2>/dev/null || true
+          done
+          sudo sysctl -w vm.swappiness=60 || true
+
+          ( while true; do
+              sleep 600
+              echo "[monitor $(date +%H:%M)]"; df -h / "$GITHUB_WORKSPACE" | cat; free -h | sed -n 1,3p
+            done ) 2>/dev/null &
+          MONITOR=$!
+          disown "$MONITOR"   # no "Terminated" notice in the log when it is stopped
+          # stop the monitor AND its pending sleep (an orphaned sleep would hold the step's output open)
+          trap 'pkill -P $MONITOR 2>/dev/null || true; kill $MONITOR 2>/dev/null || true' EXIT
+
+          MODE="$BUILD_MODE"
+          if [ "$MODE" = auto ]; then
             if [ -x tools/bazel ] && [ -f common/BUILD.bazel ]; then
-              MODE="kleaf"
+              MODE=kleaf
             elif [ -f build/build.sh ] || [ -f build/kernel/build.sh ]; then
-              MODE="legacy"
+              MODE=legacy
             else
-              echo "::error::Could not detect build system (neither tools/bazel nor build.sh found)"
+              echo "::error::Cannot detect the build system: no tools/bazel + common/BUILD.bazel and no build/build.sh"
               exit 1
             fi
           fi
-          echo "Detected/Selected build mode: $MODE"
+          echo "Build mode: $MODE"
+          echo "MODE=$MODE" >> "$GITHUB_ENV"
 
-          if [ "$MODE" = "kleaf" ]; then
-            TARGET="${{ inputs.bazel_target }}"
-            LTO_FLAG=""
-            if [ "${{ inputs.lto }}" != "default" ]; then
-              LTO_FLAG="--lto=${{ inputs.lto }}"
-            fi
+          if [ "$MODE" = kleaf ]; then
+            [ -x tools/bazel ] || { echo "::error::build_mode=kleaf but tools/bazel does not exist in this tree"; exit 1; }
 
-            # Android 14+ Kleaf uses --destdir; older Android 13 Kleaf uses --dist_dir
-            if grep -rq -- '--destdir' build/kernel/kleaf/ 2>/dev/null; then
-              DIST_FLAG="--destdir=$DIST_DIR"
+            OPTS=(--curses=no --color=no --show_progress_rate_limit=30)
+            [ "$LTO_MODE" != default ] && OPTS+=("--lto=$LTO_MODE")
+            read -r -a EXTRA <<< "${EXTRA_ARGS:-}"
+
+            # Android 14+ dist rules take --destdir; Android 13 only knows --dist_dir
+            if grep -rqs --include='*.py' --include='*.bzl' -- '--destdir' build/bazel_common_rules/dist build/kernel/kleaf 2>/dev/null; then
+              FLAG=--destdir; ALT=--dist_dir
             else
-              DIST_FLAG="--dist_dir=$DIST_DIR"
+              FLAG=--dist_dir; ALT=--destdir
             fi
 
-            echo "Running: tools/bazel run $LTO_FLAG $TARGET -- $DIST_FLAG"
-            tools/bazel run $LTO_FLAG "$TARGET" -- "$DIST_FLAG"
-
+            run_bazel() {
+              echo "+ tools/bazel run ${OPTS[*]} ${EXTRA[*]} $BAZEL_TARGET -- $1=$DIST_DIR"
+              tools/bazel run "${OPTS[@]}" "${EXTRA[@]}" "$BAZEL_TARGET" -- "$1=$DIST_DIR" 2>&1 | tee -a "$LOG"
+            }
+            if ! run_bazel "$FLAG"; then
+              if grep -q 'unrecognized arguments' "$LOG"; then
+                echo "::warning::$FLAG was rejected by the dist rule; retrying with $ALT"
+                run_bazel "$ALT"
+              else
+                exit 1
+              fi
+            fi
           else
-            if [ -f build/kernel/build.sh ]; then
-              BUILD_SH="build/kernel/build.sh"
-            else
-              BUILD_SH="build/build.sh"
-            fi
-
-            export BUILD_CONFIG="${{ inputs.build_config }}"
+            BUILD_SH=build/build.sh
+            [ -f build/kernel/build.sh ] && BUILD_SH=build/kernel/build.sh
+            export BUILD_CONFIG="$BUILD_CONFIG_IN"
             export OUT_DIR="$PWD/out"
-            export DIST_DIR="$DIST_DIR"
-            if [ "${{ inputs.lto }}" != "default" ]; then
-              export LTO="${{ inputs.lto }}"
-            fi
-
-            echo "Running: BUILD_CONFIG=$BUILD_CONFIG $BUILD_SH"
-            bash "$BUILD_SH"
+            export DIST_DIR
+            [ "$LTO_MODE" != default ] && export LTO="$LTO_MODE"
+            echo "+ BUILD_CONFIG=$BUILD_CONFIG ${LTO:+LTO=$LTO }$BUILD_SH"
+            bash "$BUILD_SH" 2>&1 | tee -a "$LOG"
           fi
 
-          echo "Build completed. Dist contents:"
+          echo "Build finished. Dist contents:"
           ls -lh "$DIST_DIR"
 
-      - name: Package GKI outputs & generate checksums
+      - name: Package outputs
         run: |
-          DIST_DIR="$GITHUB_WORKSPACE/gki_dist"
-          PKG_DIR="$GITHUB_WORKSPACE/gki_release"
-          mkdir -p "$PKG_DIR"
+          DIST="$GITHUB_WORKSPACE/gki_dist"
+          OUT="$GITHUB_WORKSPACE/gki_release"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+          [ -n "$(ls -A "$DIST" 2>/dev/null)" ] || { echo "::error::The build produced an empty dist directory"; exit 1; }
 
-          # Save a copy of the exact manifest used for reproducibility
-          cp "$GITHUB_WORKSPACE/gki/.repo/manifests/custom_manifest.xml" "$PKG_DIR/manifest.xml"
+          # Modules: hundreds of small files -> one archive
+          ( cd "$DIST" && find . -type f \( -name '*.ko' -o -name 'modules.*' \) -print0 | sort -z ) > "$RUNNER_TEMP/modules.list"
+          if [ -s "$RUNNER_TEMP/modules.list" ]; then
+            echo "Archiving $(tr -cd '\0' < "$RUNNER_TEMP/modules.list" | wc -c) module files"
+            tar -C "$DIST" --null -T "$RUNNER_TEMP/modules.list" -cf - | zstd -T0 -12 -q -o "$OUT/gki-modules.tar.zst"
+          fi
 
-          # Copy kernel images, boot images, System.map, and config artifacts
-          shopt -s nullglob
-          for f in \
-            "$DIST_DIR"/Image* \
-            "$DIST_DIR"/boot*.img \
-            "$DIST_DIR"/System.map \
-            "$DIST_DIR"/*.img \
-            "$DIST_DIR"/gki* \
-            "$DIST_DIR"/abi* ; do
-            if [ -f "$f" ]; then
-              cp -v "$f" "$PKG_DIR/"
+          # Everything else, flattened. Big uncompressed files (vmlinux) are zstd-compressed;
+          # images and already-compressed files are copied as they are.
+          ( cd "$DIST" && find . -type f ! -name '*.ko' ! -name 'modules.*' -print0 ) | while IFS= read -r -d '' f; do
+            f="${f#./}"; flat="${f//\//__}"; size=$(stat -c %s "$DIST/$f")
+            case "$f" in
+              *.img|*.gz|*.lz4|*.zst|*.xz|*.zip|*.bz2|*.tgz|*.tar*) big=0 ;;
+              *) [ "$size" -gt 104857600 ] && big=1 || big=0 ;;
+            esac
+            if [ "$big" = 1 ]; then
+              echo "zstd: $f ($((size / 1048576)) MiB)"
+              zstd -T0 -12 -q "$DIST/$f" -o "$OUT/$flat.zst"
+            else
+              cp -v "$DIST/$f" "$OUT/$flat"
             fi
           done
 
-          # Archive kernel modules (.ko) if present
-          ko_files=("$DIST_DIR"/*.ko)
-          if [ ${#ko_files[@]} -gt 0 ]; then
-            echo "Archiving ${#ko_files[@]} kernel modules..."
-            tar -C "$DIST_DIR" -cf - *.ko modules.* 2>/dev/null | zstd -T0 -12 -o "$PKG_DIR/gki-modules.tar.zst" || \
-            tar -C "$DIST_DIR" -cf - *.ko | zstd -T0 -12 -o "$PKG_DIR/gki-modules.tar.zst"
-          fi
+          # GitHub release assets are limited to 2 GiB each
+          for f in "$OUT"/*; do
+            [ "$(stat -c %s "$f")" -gt 2040109465 ] || continue
+            echo "Splitting $(basename "$f") (over 1.9 GiB)"
+            split -b 1900M -d -a 2 "$f" "$f.part"; rm -f "$f"
+          done
 
-          # Compress vmlinux separately if present (uncompressed vmlinux is often 400+ MB)
-          if [ -f "$DIST_DIR/vmlinux" ]; then
-            echo "Compressing vmlinux..."
-            zstd -T0 -12 "$DIST_DIR/vmlinux" -o "$PKG_DIR/vmlinux.zst"
-          fi
+          cp "$GITHUB_WORKSPACE/custom_manifest.xml" "$OUT/manifest.xml"
+          [ -f "$GITHUB_WORKSPACE/resolved-manifest.xml" ] && cp "$GITHUB_WORKSPACE/resolved-manifest.xml" "$OUT/resolved-manifest.xml" || true
 
-          cd "$PKG_DIR"
-          ls -lh
-          sha256sum * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          KVER=unknown
+          for d in common kernel/common aosp; do
+            if [ -f "$GITHUB_WORKSPACE/gki/$d/Makefile" ]; then
+              KVER=$(awk -F' *= *' '/^(VERSION|PATCHLEVEL|SUBLEVEL)[ \t]*=/ {v[$1]=$2} END {print v["VERSION"] "." v["PATCHLEVEL"] "." v["SUBLEVEL"]}' "$GITHUB_WORKSPACE/gki/$d/Makefile")
+              break
+            fi
+          done
+          {
+            echo "Android GKI kernel build"
+            echo "manifest url : $MANIFEST_XML_URL"
+            echo "manifest repo: $MANIFEST_REPO_URL"
+            echo "build mode   : ${MODE:-unknown}"
+            echo "lto          : $LTO_MODE"
+            [ "${MODE:-}" = kleaf ]  && echo "target       : $BAZEL_TARGET ${EXTRA_ARGS:-}"
+            [ "${MODE:-}" = legacy ] && echo "build config : $BUILD_CONFIG_IN"
+            echo "kernel       : $KVER"
+            echo "workflow run : $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "built at     : $(date -u +%FT%TZ)"
+          } > "$OUT/BUILD-INFO.txt"
 
-      - name: Upload GKI artifacts
+          ( cd "$OUT" && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\n' | sort | xargs -d '\n' sha256sum > SHA256SUMS.txt )
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+          ls -lh "$OUT"; echo; cat "$OUT/SHA256SUMS.txt"
+          { echo "### GKI $KVER built ($MODE)"; echo; ls -lh "$OUT" | awk 'NR>1 {print "- " $9 " (" $5 ")"}'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: ${{ inputs.upload_artifact }}
         uses: actions/upload-artifact@v4
         with:
-          name: gki-${{ inputs.release_tag }}-${{ github.run_id }}
+          name: gki-${{ github.run_id }}
           path: gki_release/*
           retention-days: 14
+          if-no-files-found: error
 
-      - name: Publish GitHub Release
-        if: ${{ inputs.create_release }}
-        uses: softprops/action-gh-release@v2
+      - name: Upload build log (failed or cancelled run)
+        if: ${{ failure() || cancelled() }}
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ inputs.release_tag }}-${{ github.run_id }}
-          name: "Android GKI Kernel (${{ inputs.release_tag }})"
-          body: |
-            ### Android GKI Kernel Build
-            - **Manifest URL:** `${{ inputs.manifest_xml_url }}`
-            - **LTO:** `${{ inputs.lto }}`
-            - **Build Mode:** `${{ inputs.build_mode }}`
-          files: gki_release/*
+          name: gki-build-log-${{ github.run_id }}
+          path: build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Publish to GitHub Releases
+        if: ${{ inputs.create_release }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd "$GITHUB_WORKSPACE/gki_release"
+          TAG="${RELEASE_TAG}-${GITHUB_RUN_ID}"
+
+          {
+            echo "## Android GKI kernel ${KVER:-}"
+            echo
+            echo "Built from the manifest below with build mode \`${MODE:-?}\`, LTO \`$LTO_MODE\`."
+            echo "\`resolved-manifest.xml\` pins the exact commits that were built."
+            echo
+            echo '```'
+            cat BUILD-INFO.txt
+            echo
+            cat SHA256SUMS.txt
+            echo '```'
+            if ls ./*.part* >/dev/null 2>&1; then
+              echo
+              echo 'Files named `*.partNN` were split to fit the 2 GiB asset limit: `cat name.part* > name`.'
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+
+          # Draft first: the release only goes public once every file is uploaded
+          gh release create "$TAG" --draft --target "$GITHUB_SHA" \
+            --title "Android GKI ${KVER:-} ($TAG)" --notes-file "$RUNNER_TEMP/notes.md"
+
+          for f in *; do
+            for try in 1 2 3; do
+              echo "Uploading $f (attempt $try)"
+              gh release upload "$TAG" "$f" --clobber && break
+              [ "$try" = 3 ] && { echo "::error::upload of $f failed 3 times"; exit 1; }
+              sleep 30
+            done
+          done
+
+          gh release edit "$TAG" --draft=false
+          echo "### Published release \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
