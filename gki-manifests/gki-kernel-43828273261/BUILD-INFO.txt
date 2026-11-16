@@ -1,0 +1,9 @@
+Android GKI kernel build
+manifest url : https://storage.googleapis.com/android-build/builds/aosp_kernel-common-android15-6.6-2026-10-linux-kernel_aarch64/16867777/8cd5e232416499aaccb4acfada29b9e0d21fcaaff09aab244321a38bf177b013/1/manifest_16867777.xml?GoogleAccessId=gcs-sign%40android-builds-project.google.com.iam.gserviceaccount.com&Expires=1794816507&Signature=AlG%2BPK6ef75NqlQbKNZRpczTxeHvB9NvANR6aG9MT1uzfpQMQ2gDwwdEgIo1RAH5Hz1ZOvYDKP7rOKbU16%2F0j3%2FKtZHJY60VwHtUf%2B3AcjD2Y2iSXW50Ysaci2qc%2Bn2y4B8DZumeY4ptCgFefvv4q5AOBNVDGgo8KUP1FvBhaQfQA3RSV%2BRg5XXTBaLKPgLuFSLZfuVu1QbMvhw%2F7HZ863P9lGZvIk4r5A%2BtUlsdLQXCCHXr49be%2FAO%2FxVbRoBQVFFnwu6FiOber9rRORa64vST1l3e3yfv4Q7o0NNo9MH9Vtja6YmrQ6Ye0mwEQTaJKC%2FyP53%2Fn1IKDdt16z5yudQ%3D%3D&response-content-disposition=attachment
+manifest repo: https://android.googlesource.com/kernel/manifest
+build mode   : kleaf
+lto          : default
+target       : //common:kernel_aarch64_dist 
+kernel       : 6.6.143
+workflow run : https://github.com/mahdi-salimi05/lineage_build_unified/actions/runs/43828273261
+built at     : 2026-11-16T08:25:13Z
