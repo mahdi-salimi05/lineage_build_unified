@@ -1,0 +1,9 @@
+Android GKI kernel build
+manifest url : https://storage.googleapis.com/android-build/builds/aosp_kernel-common-android15-6.6-2026-10-linux-kernel_aarch64/16867777/8cd5e232416499aaccb4acfada29b9e0d21fcaaff09aab244321a38bf177b013/1/manifest_16867777.xml (query string removed)
+manifest repo: https://android.googlesource.com/kernel/manifest
+build mode   : kleaf
+lto          : default
+target       : //common:kernel_aarch64_dist 
+kernel       : 6.6.143
+workflow run : https://github.com/mahdi-salimi05/lineage_build_unified/actions/runs/43832914255
+built at     : 2026-11-16T09:14:49Z
