@@ -58,6 +58,11 @@ on:
           - thin
           - full
           - none
+      stamp:
+        description: 'Kleaf only: enable --config=stamp to embed the Git SCM version and a real build timestamp instead of -maybe-dirty / the epoch'
+        required: false
+        default: true
+        type: boolean
       extra_args:
         description: 'Kleaf only: extra bazel options placed before the target, e.g. --config=fast (space separated, no quotes)'
         required: false
@@ -112,6 +117,7 @@ jobs:
       BAZEL_TARGET: ${{ inputs.bazel_target }}
       BUILD_CONFIG_IN: ${{ inputs.build_config }}
       LTO_MODE: ${{ inputs.lto }}
+      STAMP_BUILD: ${{ inputs.stamp }}
       EXTRA_ARGS: ${{ inputs.extra_args }}
       SHALLOW_SYNC: ${{ inputs.shallow_sync }}
       RELEASE_TAG: ${{ inputs.release_tag }}
@@ -354,8 +360,21 @@ jobs:
           if [ "$MODE" = kleaf ]; then
             [ -x tools/bazel ] || { echo "::error::build_mode=kleaf but tools/bazel does not exist in this tree"; exit 1; }
 
-            OPTS=(--curses=no --color=no --show_progress_rate_limit=30)
+            export BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+            OPTS=(--curses=no --color=no --show_progress_rate_limit=30
+                  "--action_env=BUILD_NUMBER=$BUILD_NUMBER")
             [ "$LTO_MODE" != default ] && OPTS+=("--lto=$LTO_MODE")
+
+            # Kleaf's action environment is hermetic. Pass SOURCE_DATE_EPOCH into
+            # Bazel actions explicitly; Kleaf's _setup_env.sh uses it to set
+            # KBUILD_BUILD_TIMESTAMP. This gives a wall-clock build timestamp
+            # (rather than the Git commit timestamp) and makes builds differ by run.
+            # --config=stamp separately enables Git SCM metadata (-g<commit>)
+            # instead of the default -maybe-dirty suffix.
+            if [ "${STAMP_BUILD:-true}" = true ]; then
+              export SOURCE_DATE_EPOCH="$(date +%s)"
+              OPTS+=(--config=stamp "--action_env=SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH")
+            fi
             read -r -a EXTRA <<< "${EXTRA_ARGS:-}"
 
             # Android 14+ dist rules take --destdir; Android 13 only knows --dist_dir
@@ -383,6 +402,10 @@ jobs:
             export BUILD_CONFIG="$BUILD_CONFIG_IN"
             export OUT_DIR="$PWD/out"
             export DIST_DIR
+            # Legacy build.sh inherits SOURCE_DATE_EPOCH; its setup script derives
+            # KBUILD_BUILD_TIMESTAMP from this value instead of falling back to 1970.
+            export SOURCE_DATE_EPOCH="$(date +%s)"
+            export BUILD_NUMBER="$GITHUB_RUN_NUMBER"
             [ "$LTO_MODE" != default ] && export LTO="$LTO_MODE"
             echo "+ BUILD_CONFIG=$BUILD_CONFIG ${LTO:+LTO=$LTO }$BUILD_SH"
             bash "$BUILD_SH" 2>&1 | tee -a "$LOG"
@@ -450,6 +473,7 @@ jobs:
             echo "manifest repo: $MANIFEST_REPO_URL"
             echo "build mode   : ${MODE:-unknown}"
             echo "lto          : $LTO_MODE"
+            [ "${MODE:-}" = kleaf ]  && echo "stamp        : ${STAMP_BUILD:-true}"
             [ "${MODE:-}" = kleaf ]  && echo "target       : $BAZEL_TARGET ${EXTRA_ARGS:-}"
             [ "${MODE:-}" = legacy ] && echo "build config : $BUILD_CONFIG_IN"
             echo "kernel       : $KVER"
