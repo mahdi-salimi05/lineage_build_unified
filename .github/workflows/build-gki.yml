@@ -73,6 +73,11 @@ on:
         required: false
         default: false
         type: boolean
+      commit_manifest:
+        description: 'Also commit the used manifest.xml, resolved-manifest.xml and BUILD-INFO.txt into gki-manifests/ in this repository (successful builds only; the release already contains them)'
+        required: false
+        default: true
+        type: boolean
       create_release:
         description: 'Publish the images to GitHub Releases (no storage quota). At least one of upload_artifact / create_release must be on'
         required: false
@@ -300,6 +305,16 @@ jobs:
           repo manifest -r -o "$GITHUB_WORKSPACE/resolved-manifest.xml" || echo "::warning::could not write the resolved manifest"
           df -h / "$GITHUB_WORKSPACE" | cat
 
+      - name: Upload the used manifest.xml (small workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-manifest-${{ github.run_id }}
+          path: |
+            custom_manifest.xml
+            resolved-manifest.xml
+          retention-days: 30
+          if-no-files-found: ignore
+
       - name: Build GKI
         timeout-minutes: 300
         run: |
@@ -501,3 +516,53 @@ jobs:
           path: gki_release/*
           retention-days: 14
           if-no-files-found: error
+
+      # Pushes with the workflow token. The token goes in a one-off auth header, so it is never
+      # written to .git/config. A protected branch or a rejected push only warns: the release and
+      # the artifacts above are the real outputs.
+      - name: Commit the used manifest.xml into this repository
+        if: ${{ !cancelled() && inputs.commit_manifest && steps.package.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" != branch ]; then
+            echo "::warning::The run was started from $GITHUB_REF_TYPE '$GITHUB_REF_NAME', not a branch - manifests not committed"
+            exit 0
+          fi
+          B64=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$B64"
+          g() { git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $B64" "$@"; }
+
+          SAFE_TAG=$(printf '%s' "$RELEASE_TAG" | tr -c 'A-Za-z0-9._-' '_')
+          DEST="gki-manifests/${SAFE_TAG}-${GITHUB_RUN_ID}"
+          WORK="$GITHUB_WORKSPACE/repo_push"
+          trap 'rm -rf "$WORK"' EXIT
+
+          for try in 1 2 3; do
+            cd "$GITHUB_WORKSPACE"   # a retry must not start inside the clone it is about to delete
+            rm -rf "$WORK"
+            g clone --quiet --depth=1 --branch "$GITHUB_REF_NAME" "https://github.com/${GITHUB_REPOSITORY}.git" "$WORK"
+            cd "$WORK"
+            mkdir -p "$DEST"
+            cp "$GITHUB_WORKSPACE/custom_manifest.xml" "$DEST/manifest.xml"
+            for f in resolved-manifest.xml BUILD-INFO.txt; do
+              [ -f "$GITHUB_WORKSPACE/gki_release/$f" ] && cp "$GITHUB_WORKSPACE/gki_release/$f" "$DEST/$f"
+            done
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add gki-manifests
+            if git diff --cached --quiet; then
+              echo "No manifest changes to commit."
+              exit 0
+            fi
+            git commit --quiet -m "gki: save manifest for ${SAFE_TAG}-${GITHUB_RUN_ID}"
+            if g push --quiet origin "HEAD:refs/heads/$GITHUB_REF_NAME"; then
+              echo "Committed $DEST to $GITHUB_REF_NAME"
+              echo "### Manifest committed to \`$DEST\` on \`$GITHUB_REF_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "push rejected (attempt $try), retrying on a fresh clone"; sleep 5
+          done
+          echo "::warning::Could not push the manifests (protected branch or no write access?) - they are still in the release and the gki-manifest artifact"
+          exit 1
