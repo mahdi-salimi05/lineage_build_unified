@@ -407,9 +407,11 @@ jobs:
           fi
 
           # Everything else, flattened. Big uncompressed files (vmlinux) are zstd-compressed;
-          # images and already-compressed files are copied as they are.
+          # images and already-compressed files are copied as they are. Empty files (Bazel "*_checked"
+          # markers, an empty blocklist) are skipped: GitHub Releases rejects 0-byte assets with HTTP 400.
           ( cd "$DIST" && find . -type f ! -name '*.ko' ! -name 'modules.*' -print0 ) | while IFS= read -r -d '' f; do
             f="${f#./}"; flat="${f//\//__}"; size=$(stat -c %s "$DIST/$f")
+            if [ "$size" -eq 0 ]; then echo "skip (0 bytes): $f"; continue; fi
             case "$f" in
               *.img|*.gz|*.lz4|*.zst|*.xz|*.zip|*.bz2|*.tgz|*.tar*) big=0 ;;
               *) [ "$size" -gt 104857600 ] && big=1 || big=0 ;;
@@ -439,9 +441,12 @@ jobs:
               break
             fi
           done
+          # signed download links (ci / storage.googleapis.com) carry a credential in the query string
+          URL_SHOWN="${MANIFEST_XML_URL%%\?*}"
+          [ "$URL_SHOWN" = "$MANIFEST_XML_URL" ] || URL_SHOWN="$URL_SHOWN (query string removed)"
           {
             echo "Android GKI kernel build"
-            echo "manifest url : $MANIFEST_XML_URL"
+            echo "manifest url : $URL_SHOWN"
             echo "manifest repo: $MANIFEST_REPO_URL"
             echo "build mode   : ${MODE:-unknown}"
             echo "lto          : $LTO_MODE"
@@ -495,8 +500,12 @@ jobs:
           # Draft first: the release only goes public once every file is uploaded
           gh release create "$TAG" --draft --target "$GITHUB_SHA" \
             --title "Android GKI ${KVER:-} ($TAG)" --notes-file "$RUNNER_TEMP/notes.md"
+          # if anything below fails, do not leave a half-filled draft behind
+          PUBLISHED=0
+          trap '[ "$PUBLISHED" = 1 ] || { echo "Removing the unfinished draft release $TAG"; gh release delete "$TAG" --yes 2>/dev/null || echo "::warning::could not remove the draft $TAG - delete it by hand"; }' EXIT
 
           for f in *; do
+            [ -s "$f" ] || { echo "Skipping 0-byte file: $f"; continue; }
             for try in 1 2 3; do
               echo "Uploading $f (attempt $try)"
               gh release upload "$TAG" "$f" --clobber && break
@@ -506,6 +515,7 @@ jobs:
           done
 
           gh release edit "$TAG" --draft=false
+          PUBLISHED=1
           echo "### Published release \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
